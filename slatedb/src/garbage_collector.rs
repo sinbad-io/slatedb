@@ -14,7 +14,7 @@
 
 use crate::checkpoint::Checkpoint;
 use crate::compactions_store::CompactionsStore;
-use crate::config::GarbageCollectorOptions;
+use crate::config::{GarbageCollectorDirectoryOptions, GarbageCollectorOptions};
 pub use crate::db::builder::GarbageCollectorBuilder;
 use crate::db_status::ClosedResultWriter;
 use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef};
@@ -24,7 +24,7 @@ use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::Manifest;
 use crate::tablestore::TableStore;
 use crate::utils::WatchableOnceCell;
-use crate::wal::slatedb::gc::{SlateDbWalGc, WalGcMode};
+use crate::wal::slatedb::gc::SlateDbWalGc;
 use crate::wal::slatedb::store::WalTableStore;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -52,7 +52,7 @@ mod manifest_gc;
 pub mod stats;
 mod wal_gc;
 
-use crate::wal::WalGc;
+use crate::wal::{WalGc, WalGcPolicy};
 pub(crate) use filter::retain_allowed_by_gc_filter;
 pub use filter::GcFilter;
 
@@ -122,13 +122,15 @@ impl MessageHandler<GcMessage> for GarbageCollector {
                 Box::new(|| GcMessage::Manifest),
             ));
         }
-        if let Some(opts) = self.options.wal_options {
+        // A combined WAL task runs on the WAL ticker, so the fence ticker only exists when the
+        // fence policy has its own task.
+        if let (Some(opts), Some(_)) = (self.options.wal_options, &self.wal_gc_task) {
             tickers.push(MessageTickerDef::new(
                 opts.interval.unwrap_or(DEFAULT_INTERVAL),
                 Box::new(|| GcMessage::Wal),
             ));
         }
-        if let Some(opts) = self.options.wal_fence_options {
+        if let (Some(opts), Some(_)) = (self.options.wal_fence_options, &self.wal_fence_gc_task) {
             tickers.push(MessageTickerDef::new(
                 opts.interval.unwrap_or(DEFAULT_INTERVAL),
                 Box::new(|| GcMessage::WalFence),
@@ -248,40 +250,16 @@ impl GarbageCollector {
             closed_result,
             system_clock.clone(),
         ));
-        let wal_gc_task = options.wal_options.map(|wal_options| {
-            let wal_gc = wal_gc.unwrap_or_else(|| {
-                Arc::new(SlateDbWalGc::new(
-                    wal_store.clone(),
-                    stats.clone(),
-                    WalGcMode::Regular,
-                    gc_filter.clone(),
-                    system_clock.clone(),
-                ))
-            });
-            WalGcTask::new(
-                manifest_store.clone(),
-                wal_gc,
-                WalGcMode::Regular.resource(),
-                wal_options.min_age,
-                wal_options.dry_run,
-            )
-        });
-        let wal_fence_gc_task = options.wal_fence_options.map(|wal_fence_options| {
-            let wal_gc = Arc::new(SlateDbWalGc::new(
+        let wal_gc = wal_gc.unwrap_or_else(|| {
+            Arc::new(SlateDbWalGc::new(
                 wal_store,
                 stats.clone(),
-                WalGcMode::Fence,
                 gc_filter.clone(),
                 system_clock.clone(),
-            ));
-            WalGcTask::new(
-                manifest_store.clone(),
-                wal_gc,
-                WalGcMode::Fence.resource(),
-                wal_fence_options.min_age,
-                wal_fence_options.dry_run,
-            )
+            ))
         });
+        let (wal_gc_task, wal_fence_gc_task) =
+            Self::build_wal_gc_tasks(&options, &manifest_store, &wal_gc);
         let compacted_gc_task = options.compacted_options.map(|compacted_options| {
             CompactedGcTask::new(
                 manifest_store.clone(),
@@ -331,6 +309,33 @@ impl GarbageCollector {
             compacted_gc_task,
             compactions_gc_task,
             detach_gc_task,
+        }
+    }
+
+    /// Builds the (WAL, WAL fence) tasks. When both policies are enabled with the same effective
+    /// interval, the WAL task carries both so each pass lists the WAL once, and there is no
+    /// separate fence task. Otherwise each enabled policy gets its own task.
+    fn build_wal_gc_tasks(
+        options: &GarbageCollectorOptions,
+        manifest_store: &Arc<ManifestStore>,
+        wal_gc: &Arc<dyn WalGc>,
+    ) -> (Option<WalGcTask>, Option<WalGcTask>) {
+        let policy = |opts: GarbageCollectorDirectoryOptions| WalGcPolicy {
+            min_age: opts.min_age,
+            dry_run: opts.dry_run,
+        };
+        let task = |wal, fence| WalGcTask::new(manifest_store.clone(), wal_gc.clone(), wal, fence);
+        match (options.wal_options, options.wal_fence_options) {
+            (Some(wal), Some(fence))
+                if wal.interval.unwrap_or(DEFAULT_INTERVAL)
+                    == fence.interval.unwrap_or(DEFAULT_INTERVAL) =>
+            {
+                (Some(task(Some(policy(wal)), Some(policy(fence)))), None)
+            }
+            (wal, fence) => (
+                wal.map(|wal| task(Some(policy(wal)), None)),
+                fence.map(|fence| task(None, Some(policy(fence)))),
+            ),
         }
     }
 
@@ -467,6 +472,7 @@ mod tests {
     use super::*;
     use crate::block_cache_policy::BlockCachePolicy;
     use crate::tablestore::TableStoreKind;
+    use crate::test_utils::RecordingObjectStore;
     use crate::wal::slatedb::store::{WalFileId, WalTableStore};
     use bytes::Bytes;
 
@@ -1450,6 +1456,156 @@ mod tests {
         assert_eq!(wal_ssts.len(), 1);
         assert_eq!(wal_ssts[0].id, regular_wal_id_2);
         assert!(wal_ssts[0].metadata.size > 0);
+    }
+
+    #[test]
+    fn test_wal_and_wal_fence_share_a_task_only_when_intervals_match() {
+        let (manifest_store, compactions_store, table_store, wal_store, _) = build_objects();
+        let dir_opts = |interval| {
+            Some(GarbageCollectorDirectoryOptions {
+                interval,
+                ..GarbageCollectorDirectoryOptions::default()
+            })
+        };
+        let build = |wal_options, wal_fence_options| {
+            let options = GarbageCollectorOptions {
+                manifest_options: None,
+                wal_options,
+                wal_fence_options,
+                compacted_options: None,
+                compactions_options: None,
+                detach_options: None,
+                ..GarbageCollectorOptions::default()
+            };
+            let mut gc = GarbageCollector::new(
+                manifest_store.clone(),
+                compactions_store.clone(),
+                table_store.clone(),
+                wal_store.clone(),
+                Arc::new(object_store::memory::InMemory::new()),
+                options,
+                &MetricsRecorderHelper::noop(),
+                Arc::new(DefaultSystemClock::default()),
+                None,
+                None,
+            );
+            let tickers = gc.tickers().len();
+            (
+                gc.wal_gc_task.as_ref().map(|t| t.resource().to_string()),
+                gc.wal_fence_gc_task
+                    .as_ref()
+                    .map(|t| t.resource().to_string()),
+                tickers,
+            )
+        };
+        let combined = (Some("WAL and WAL fence".to_string()), None, 1);
+        let split = (Some("WAL".to_string()), Some("WAL fence".to_string()), 2);
+
+        // An unset interval means the default interval.
+        assert_eq!(build(dir_opts(None), dir_opts(None)), combined);
+        assert_eq!(
+            build(dir_opts(None), dir_opts(Some(DEFAULT_INTERVAL))),
+            combined
+        );
+        assert_eq!(
+            build(dir_opts(None), dir_opts(Some(Duration::from_secs(1)))),
+            split
+        );
+        assert_eq!(
+            build(dir_opts(None), None),
+            (Some("WAL".to_string()), None, 1)
+        );
+        assert_eq!(
+            build(None, dir_opts(None)),
+            (None, Some("WAL fence".to_string()), 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shared_wal_and_wal_fence_task_lists_wal_once() {
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
+        let path_resolver = PathResolver::from_root("/");
+
+        write_wal_fence(wal_store.clone(), 1).await;
+        write_wal_sst(wal_store.clone(), WalFileId::from(2))
+            .await
+            .unwrap();
+        write_wal_sst(wal_store.clone(), WalFileId::from(3))
+            .await
+            .unwrap();
+        for id in 1..=3 {
+            set_modified(
+                local_object_store.clone(),
+                &path_resolver.wal_sst_path(&WalFileId::from(id)),
+                86400,
+            );
+        }
+
+        let mut state = ManifestCore::new();
+        state.replay_after_wal_id = 3;
+        StoredManifest::create_new_db(
+            manifest_store.clone(),
+            state,
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+
+        let recording = Arc::new(RecordingObjectStore::new(local_object_store));
+        let recorded_wal_store = Arc::new(WalTableStore::new(
+            recording.clone(),
+            SsTableFormat::default(),
+            Path::from("/"),
+            TableStoreKind::GC,
+        ));
+        // Unset intervals put WAL and WAL fence GC in one task.
+        let dir_opts = Some(GarbageCollectorDirectoryOptions {
+            min_age: Duration::from_secs(3600),
+            interval: None,
+            dry_run: false,
+        });
+        let gc_opts = GarbageCollectorOptions {
+            manifest_options: None,
+            wal_options: dir_opts,
+            wal_fence_options: dir_opts,
+            compacted_options: None,
+            compactions_options: None,
+            detach_options: None,
+            ..GarbageCollectorOptions::default()
+        };
+        let gc = GarbageCollector::new(
+            manifest_store,
+            compactions_store,
+            table_store,
+            recorded_wal_store,
+            Arc::new(object_store::memory::InMemory::new()),
+            gc_opts,
+            &MetricsRecorderHelper::noop(),
+            Arc::new(DefaultSystemClock::default()),
+            None,
+            None,
+        );
+
+        gc.run_gc_once().await;
+
+        let wal_path = path_resolver.wal_path();
+        let wal_lists = recording
+            .list_prefixes()
+            .into_iter()
+            .filter(|prefix| prefix.as_ref() == Some(&wal_path))
+            .count();
+        assert_eq!(wal_lists, 1);
+
+        // Both policies ran: the fence and the unreferenced regular WAL are gone.
+        let remaining = wal_store
+            .list_wal_ssts(..)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|wal| wal.id)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec![WalFileId::from(3)]);
     }
 
     /// This test creates eight compacted SSTs:

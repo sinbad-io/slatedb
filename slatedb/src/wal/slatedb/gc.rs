@@ -1,7 +1,7 @@
 use crate::garbage_collector::stats::GcStats;
 use crate::garbage_collector::{retain_allowed_by_gc_filter, GcFilter, GC_DELETE_CONCURRENCY};
 use crate::wal::slatedb::store::{WalFileId, WalTableStore};
-use crate::wal::{WalError, WalFileRange, WalGc};
+use crate::wal::{WalError, WalFileRange, WalGc, WalGcPolicy, WalGcRequest};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
@@ -10,29 +10,26 @@ use slatedb_common::clock::SystemClock;
 use slatedb_common::object_metadata::IdentifiedObjectMetadata;
 use std::ops::Bound;
 use std::sync::Arc;
-use std::time::Duration;
 
-/// Selects which class of SlateDB WAL object is collected.
+/// The two classes of object stored in a SlateDB WAL directory.
 ///
 /// Regular WAL SSTs and zero-byte WAL fence objects share the same WAL
 /// directory and `WalFileId` identifier space, but they have separate
-/// retention policies. This mode keeps a single implementation while
-/// allowing regular WAL GC and fence WAL GC to run on independent schedules.
+/// retention policies.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum WalGcMode {
-    /// Collect non-empty WAL SSTs that are old enough for retention and unreferenced by active
-    /// manifests.
-    Regular,
+enum WalObjectKind {
+    /// Non-empty WAL SSTs, collected under [`WalGcRequest::wal`].
+    Wal,
 
-    /// Collect zero-byte WAL fence objects under the same safety checks as regular WAL GC.
+    /// Zero-byte WAL fence objects, collected under [`WalGcRequest::fence`].
     Fence,
 }
 
-impl WalGcMode {
-    pub(crate) fn resource(self) -> &'static str {
+impl WalObjectKind {
+    fn resource(self) -> &'static str {
         match self {
-            WalGcMode::Regular => "WAL",
-            WalGcMode::Fence => "WAL fence",
+            WalObjectKind::Wal => "WAL",
+            WalObjectKind::Fence => "WAL fence",
         }
     }
 }
@@ -41,16 +38,13 @@ impl WalGcMode {
 pub(crate) struct SlateDbWalGc {
     wal_store: Arc<WalTableStore>,
     stats: Arc<GcStats>,
-    mode: WalGcMode,
     gc_filter: Option<Arc<dyn GcFilter>>,
     system_clock: Arc<dyn SystemClock>,
 }
 
 impl std::fmt::Debug for SlateDbWalGc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SlateDbWalGc")
-            .field("mode", &self.mode)
-            .finish()
+        f.debug_struct("SlateDbWalGc").finish()
     }
 }
 
@@ -58,14 +52,12 @@ impl SlateDbWalGc {
     pub(crate) fn new(
         wal_store: Arc<WalTableStore>,
         stats: Arc<GcStats>,
-        mode: WalGcMode,
         gc_filter: Option<Arc<dyn GcFilter>>,
         system_clock: Arc<dyn SystemClock>,
     ) -> Self {
         Self {
             wal_store,
             stats,
-            mode,
             gc_filter,
             system_clock,
         }
@@ -101,22 +93,54 @@ impl SlateDbWalGc {
         after_start && before_end
     }
 
-    fn wal_sst_min_age(&self, min_age: Duration) -> chrono::Duration {
-        chrono::Duration::from_std(min_age).expect("invalid duration")
+    /// Applies `policy` to `wal_ssts`, which must all be of the given `kind`.
+    async fn collect_kind(
+        &self,
+        kind: WalObjectKind,
+        wal_ssts: Vec<IdentifiedObjectMetadata<WalFileId>>,
+        policy: WalGcPolicy,
+        utc_now: &DateTime<Utc>,
+        referenced_ranges: &[WalFileRange],
+    ) {
+        let min_age = chrono::Duration::from_std(policy.min_age).expect("invalid duration");
+        let ssts_to_delete = wal_ssts
+            .into_iter()
+            .filter(|wal_sst| {
+                Self::is_wal_sst_eligible_for_deletion(
+                    utc_now,
+                    wal_sst,
+                    &min_age,
+                    referenced_ranges,
+                )
+            })
+            .collect::<Vec<_>>();
+        let ssts_to_delete = retain_allowed_by_gc_filter(&self.gc_filter, ssts_to_delete).await;
+        let sst_ids_to_delete = ssts_to_delete
+            .into_iter()
+            .map(|wal_sst| wal_sst.id)
+            .collect::<Vec<_>>();
+
+        self.maybe_delete_wal_ssts(kind, sst_ids_to_delete, policy.dry_run)
+            .await;
     }
 
     /// Deletes the given WAL SSTs from the table store.
     ///
     /// In case of dryrun, the actual deletion doesn't happen.
-    async fn maybe_delete_wal_ssts(&self, sst_ids: Vec<WalFileId>, dry_run: bool) {
+    async fn maybe_delete_wal_ssts(
+        &self,
+        kind: WalObjectKind,
+        sst_ids: Vec<WalFileId>,
+        dry_run: bool,
+    ) {
         if dry_run {
             if !sst_ids.is_empty() {
                 log::info!(
                     "dry run: skipping {} deletion [count={}]",
-                    self.mode.resource(),
+                    kind.resource(),
                     sst_ids.len()
                 );
-                if matches!(self.mode, WalGcMode::Fence) {
+                if matches!(kind, WalObjectKind::Fence) {
                     log::info!(
                         "WAL fence GC is dry-run by default. This is a conservative setting. \
                         Set wal_fence_options.dry_run=false and use a conservative min_age to enable. \
@@ -127,7 +151,7 @@ impl SlateDbWalGc {
             for id in sst_ids {
                 log::debug!(
                     "dry run: would delete {} but skipped [id={:?}]",
-                    self.mode.resource(),
+                    kind.resource(),
                     id
                 );
             }
@@ -139,9 +163,9 @@ impl SlateDbWalGc {
                 if let Err(e) = self.wal_store.delete_sst(id).await {
                     error!("error deleting WAL SST [id={:?}, error={}]", id, e);
                 } else {
-                    match self.mode {
-                        WalGcMode::Regular => self.stats.gc_wal_count.increment(1),
-                        WalGcMode::Fence => self.stats.gc_wal_fence_count.increment(1),
+                    match kind {
+                        WalObjectKind::Wal => self.stats.gc_wal_count.increment(1),
+                        WalObjectKind::Fence => self.stats.gc_wal_fence_count.increment(1),
                     }
                 }
             })
@@ -151,41 +175,40 @@ impl SlateDbWalGc {
 
 #[async_trait]
 impl WalGc for SlateDbWalGc {
-    async fn collect(
-        &self,
-        referenced_ranges: Vec<WalFileRange>,
-        min_age: Duration,
-        dry_run: bool,
-    ) -> Result<(), WalError> {
+    async fn collect(&self, request: WalGcRequest) -> Result<(), WalError> {
+        if request.wal.is_none() && request.fence.is_none() {
+            return Ok(());
+        }
+
         let utc_now = self.system_clock.now();
-        let min_age = self.wal_sst_min_age(min_age);
-        let ssts_to_delete = self
+        // One listing serves both policies. Fences are the zero-byte objects.
+        let (fences, wals): (Vec<_>, Vec<_>) = self
             .wal_store
             .list_wal_ssts(..)
             .await?
             .into_iter()
-            .filter(|wal_sst| match self.mode {
-                // In regular mode, only consider WAL SSTs with size > 0 for deletion.
-                WalGcMode::Regular => wal_sst.metadata.size > 0,
-                // In fence mode, only consider zero-byte WAL SSTs for deletion.
-                WalGcMode::Fence => wal_sst.metadata.size == 0,
-            })
-            .filter(|wal_sst| {
-                Self::is_wal_sst_eligible_for_deletion(
-                    &utc_now,
-                    wal_sst,
-                    &min_age,
-                    &referenced_ranges,
-                )
-            })
-            .collect::<Vec<_>>();
-        let ssts_to_delete = retain_allowed_by_gc_filter(&self.gc_filter, ssts_to_delete).await;
-        let sst_ids_to_delete = ssts_to_delete
-            .into_iter()
-            .map(|wal_sst| wal_sst.id)
-            .collect::<Vec<_>>();
+            .partition(|wal_sst| wal_sst.metadata.size == 0);
 
-        self.maybe_delete_wal_ssts(sst_ids_to_delete, dry_run).await;
+        if let Some(policy) = request.wal {
+            self.collect_kind(
+                WalObjectKind::Wal,
+                wals,
+                policy,
+                &utc_now,
+                &request.referenced_ranges,
+            )
+            .await;
+        }
+        if let Some(policy) = request.fence {
+            self.collect_kind(
+                WalObjectKind::Fence,
+                fences,
+                policy,
+                &utc_now,
+                &request.referenced_ranges,
+            )
+            .await;
+        }
 
         Ok(())
     }
@@ -214,18 +237,28 @@ mod tests {
         ))
     }
 
-    fn build_collector(
-        wal_store: Arc<WalTableStore>,
-        clock: Arc<MockSystemClock>,
-        mode: WalGcMode,
-    ) -> SlateDbWalGc {
+    fn build_collector(wal_store: Arc<WalTableStore>, clock: Arc<MockSystemClock>) -> SlateDbWalGc {
         SlateDbWalGc::new(
             wal_store,
             Arc::new(GcStats::new(&MetricsRecorderHelper::noop())),
-            mode,
             None,
             clock,
         )
+    }
+
+    fn policy(min_age: Duration) -> Option<WalGcPolicy> {
+        Some(WalGcPolicy {
+            min_age,
+            dry_run: false,
+        })
+    }
+
+    fn wal_request(referenced_ranges: Vec<WalFileRange>, min_age: Duration) -> WalGcRequest {
+        WalGcRequest::new(referenced_ranges, policy(min_age), None)
+    }
+
+    fn fence_request(referenced_ranges: Vec<WalFileRange>, min_age: Duration) -> WalGcRequest {
+        WalGcRequest::new(referenced_ranges, None, policy(min_age))
     }
 
     async fn write_regular_wal(wal_store: &WalTableStore, wal_id: u64) {
@@ -277,17 +310,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn regular_mode_deletes_unreferenced_range_and_keeps_referenced_wals() {
+    async fn wal_policy_deletes_unreferenced_range_and_keeps_referenced_wals() {
         let wal_store = build_wal_store();
         let clock = Arc::new(MockSystemClock::new());
         for wal_id in 1..=4 {
             write_regular_wal(&wal_store, wal_id).await;
         }
         make_all_wals_older_than(&wal_store, &clock, Duration::ZERO).await;
-        let collector = build_collector(wal_store.clone(), clock, WalGcMode::Regular);
+        let collector = build_collector(wal_store.clone(), clock);
 
         collector
-            .collect(protect_outer_wals(), Duration::ZERO, false)
+            .collect(wal_request(protect_outer_wals(), Duration::ZERO))
             .await
             .unwrap();
 
@@ -295,16 +328,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn regular_mode_does_not_touch_fence_wals() {
+    async fn wal_policy_does_not_touch_fences() {
         let wal_store = build_wal_store();
         let clock = Arc::new(MockSystemClock::new());
         write_regular_wal(&wal_store, 1).await;
         write_fence_wal(&wal_store, 2).await;
         make_all_wals_older_than(&wal_store, &clock, Duration::ZERO).await;
-        let collector = build_collector(wal_store.clone(), clock, WalGcMode::Regular);
+        let collector = build_collector(wal_store.clone(), clock);
 
         collector
-            .collect(vec![], Duration::ZERO, false)
+            .collect(wal_request(vec![], Duration::ZERO))
             .await
             .unwrap();
 
@@ -312,35 +345,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn regular_mode_respects_min_age() {
+    async fn wal_policy_respects_min_age() {
         let wal_store = build_wal_store();
         let clock = Arc::new(MockSystemClock::new());
         write_regular_wal(&wal_store, 1).await;
         let last_modified = wal_store.metadata(1.into()).await.unwrap().last_modified;
         let min_age = Duration::from_secs(60 * 60);
-        let collector = build_collector(wal_store.clone(), clock.clone(), WalGcMode::Regular);
+        let collector = build_collector(wal_store.clone(), clock.clone());
 
         clock.set((last_modified + chrono::Duration::minutes(30)).timestamp_millis());
-        collector.collect(vec![], min_age, false).await.unwrap();
+        collector
+            .collect(wal_request(vec![], min_age))
+            .await
+            .unwrap();
         assert_eq!(wal_ids(&wal_store).await, vec![1]);
 
         clock.set((last_modified + chrono::Duration::minutes(61)).timestamp_millis());
-        collector.collect(vec![], min_age, false).await.unwrap();
+        collector
+            .collect(wal_request(vec![], min_age))
+            .await
+            .unwrap();
         assert!(wal_ids(&wal_store).await.is_empty());
     }
 
     #[tokio::test]
-    async fn fence_mode_deletes_unreferenced_range_and_keeps_referenced_wals() {
+    async fn fence_policy_deletes_unreferenced_range_and_keeps_referenced_wals() {
         let wal_store = build_wal_store();
         let clock = Arc::new(MockSystemClock::new());
         for wal_id in 1..=4 {
             write_fence_wal(&wal_store, wal_id).await;
         }
         make_all_wals_older_than(&wal_store, &clock, Duration::ZERO).await;
-        let collector = build_collector(wal_store.clone(), clock, WalGcMode::Fence);
+        let collector = build_collector(wal_store.clone(), clock);
 
         collector
-            .collect(protect_outer_wals(), Duration::ZERO, false)
+            .collect(fence_request(protect_outer_wals(), Duration::ZERO))
             .await
             .unwrap();
 
@@ -348,16 +387,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fence_mode_does_not_touch_regular_wals() {
+    async fn fence_policy_does_not_touch_regular_wals() {
         let wal_store = build_wal_store();
         let clock = Arc::new(MockSystemClock::new());
         write_fence_wal(&wal_store, 1).await;
         write_regular_wal(&wal_store, 2).await;
         make_all_wals_older_than(&wal_store, &clock, Duration::ZERO).await;
-        let collector = build_collector(wal_store.clone(), clock, WalGcMode::Fence);
+        let collector = build_collector(wal_store.clone(), clock);
 
         collector
-            .collect(vec![], Duration::ZERO, false)
+            .collect(fence_request(vec![], Duration::ZERO))
             .await
             .unwrap();
 
@@ -365,20 +404,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fence_mode_respects_min_age() {
+    async fn fence_policy_respects_min_age() {
         let wal_store = build_wal_store();
         let clock = Arc::new(MockSystemClock::new());
         write_fence_wal(&wal_store, 1).await;
         let last_modified = wal_store.metadata(1.into()).await.unwrap().last_modified;
         let min_age = Duration::from_secs(60 * 60);
-        let collector = build_collector(wal_store.clone(), clock.clone(), WalGcMode::Fence);
+        let collector = build_collector(wal_store.clone(), clock.clone());
 
         clock.set((last_modified + chrono::Duration::minutes(30)).timestamp_millis());
-        collector.collect(vec![], min_age, false).await.unwrap();
+        collector
+            .collect(fence_request(vec![], min_age))
+            .await
+            .unwrap();
         assert_eq!(wal_ids(&wal_store).await, vec![1]);
 
         clock.set((last_modified + chrono::Duration::minutes(61)).timestamp_millis());
-        collector.collect(vec![], min_age, false).await.unwrap();
+        collector
+            .collect(fence_request(vec![], min_age))
+            .await
+            .unwrap();
         assert!(wal_ids(&wal_store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn applies_each_policy_to_its_own_objects() {
+        let wal_store = build_wal_store();
+        let clock = Arc::new(MockSystemClock::new());
+        write_regular_wal(&wal_store, 1).await;
+        write_fence_wal(&wal_store, 2).await;
+        write_regular_wal(&wal_store, 3).await;
+        write_fence_wal(&wal_store, 4).await;
+        make_all_wals_older_than(&wal_store, &clock, Duration::ZERO).await;
+        let collector = build_collector(wal_store.clone(), clock);
+
+        // Fences are dry-run, so only the regular WAL outside the referenced range is deleted.
+        let request = WalGcRequest::new(
+            vec![WalFileRange(Bound::Included(3), Bound::Unbounded)],
+            policy(Duration::ZERO),
+            Some(WalGcPolicy {
+                min_age: Duration::ZERO,
+                dry_run: true,
+            }),
+        );
+        collector.collect(request).await.unwrap();
+        assert_eq!(wal_ids(&wal_store).await, vec![2, 3, 4]);
+
+        let request = WalGcRequest::new(
+            vec![WalFileRange(Bound::Included(3), Bound::Unbounded)],
+            policy(Duration::ZERO),
+            policy(Duration::ZERO),
+        );
+        collector.collect(request).await.unwrap();
+        assert_eq!(wal_ids(&wal_store).await, vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn empty_request_deletes_nothing() {
+        let wal_store = build_wal_store();
+        let clock = Arc::new(MockSystemClock::new());
+        write_regular_wal(&wal_store, 1).await;
+        write_fence_wal(&wal_store, 2).await;
+        make_all_wals_older_than(&wal_store, &clock, Duration::ZERO).await;
+        let collector = build_collector(wal_store.clone(), clock);
+
+        collector
+            .collect(WalGcRequest::new(vec![], None, None))
+            .await
+            .unwrap();
+
+        assert_eq!(wal_ids(&wal_store).await, vec![1, 2]);
     }
 }

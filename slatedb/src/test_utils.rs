@@ -1730,6 +1730,9 @@ mod tests {
 /// `TableStoreKind` / `SstType` / `RetryReason` tags it carried.
 #[derive(Clone, Debug)]
 pub(crate) enum RecordedCall {
+    List {
+        prefix: Option<Path>,
+    },
     Get {
         head: bool,
         range: Option<GetRange>,
@@ -1751,7 +1754,8 @@ pub(crate) enum RecordedCall {
 }
 
 /// Wraps an object store and records the tags carried by each
-/// get/put/multipart-init call, delegating all I/O to the inner store.
+/// get/put/multipart-init call and the prefix of each list call, delegating
+/// all I/O to the inner store.
 #[derive(Debug)]
 pub(crate) struct RecordingObjectStore {
     inner: Arc<dyn ObjectStore>,
@@ -1858,6 +1862,17 @@ impl RecordingObjectStore {
             .collect()
     }
 
+    pub(crate) fn list_prefixes(&self) -> Vec<Option<Path>> {
+        self.calls
+            .lock()
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::List { prefix } => Some(prefix.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn write_segments(&self) -> Vec<Option<Bytes>> {
         self.calls
             .lock()
@@ -1934,6 +1949,9 @@ impl ObjectStore for RecordingObjectStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.calls.lock().push(RecordedCall::List {
+            prefix: prefix.cloned(),
+        });
         self.inner.list(prefix)
     }
 
@@ -1942,6 +1960,9 @@ impl ObjectStore for RecordingObjectStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.calls.lock().push(RecordedCall::List {
+            prefix: prefix.cloned(),
+        });
         self.inner.list_with_offset(prefix, offset)
     }
 

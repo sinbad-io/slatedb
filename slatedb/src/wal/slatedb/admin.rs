@@ -2,7 +2,7 @@ use crate::format::sst::SsTableFormat;
 use crate::garbage_collector::stats::GcStats;
 use crate::paths::PathResolver;
 use crate::tablestore::TableStoreKind;
-use crate::wal::slatedb::gc::{SlateDbWalGc, WalGcMode};
+use crate::wal::slatedb::gc::SlateDbWalGc;
 use crate::wal::slatedb::store::{WalFileId, WalTableStore};
 use crate::wal::{WalAdmin, WalError, WalGc};
 use crate::VersionedManifest;
@@ -76,7 +76,6 @@ impl WalAdmin for SlateDbWalAdmin {
         Arc::new(SlateDbWalGc::new(
             wal_store,
             Arc::new(GcStats::new(&MetricsRecorderHelper::noop())),
-            WalGcMode::Regular,
             None,
             Arc::new(DefaultSystemClock::new()),
         ))

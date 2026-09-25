@@ -605,7 +605,7 @@ mod tests {
     use crate::utils::IdGenerator;
     use crate::wal::slatedb::admin::SlateDbWalAdmin;
     use crate::wal::slatedb::store::WalFileId;
-    use crate::wal::{WalAdmin, WalError, WalFileRange, WalGc};
+    use crate::wal::{WalAdmin, WalError, WalGc, WalGcRequest};
     use async_trait::async_trait;
     use bytes::Bytes;
     use fail_parallel::FailPointRegistry;
@@ -621,7 +621,6 @@ mod tests {
     use std::ops::Bound;
     use std::ops::RangeBounds;
     use std::sync::Arc;
-    use std::time::Duration;
     use uuid::Uuid;
 
     struct RemappingWalAdmin {
@@ -633,12 +632,7 @@ mod tests {
 
     #[async_trait]
     impl WalGc for NoopWalGc {
-        async fn collect(
-            &self,
-            _referenced_ranges: Vec<WalFileRange>,
-            _min_age: Duration,
-            _dry_run: bool,
-        ) -> Result<(), WalError> {
+        async fn collect(&self, _request: WalGcRequest) -> Result<(), WalError> {
             Ok(())
         }
     }

@@ -14,9 +14,9 @@ use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::path::Path;
 use slatedb::object_store::ObjectStore;
 use slatedb::wal::{
-    FlushResultFuture, WalAdmin, WalError, WalEvent, WalFileRange, WalGc, WalIterator, WalObserver,
-    WalReader, WalRows, WalStatus, WalStatusListener, WalWriter, WriterInit, WriterInitResult,
-    WriterManifest,
+    FlushResultFuture, WalAdmin, WalError, WalEvent, WalFileRange, WalGc, WalGcRequest,
+    WalIterator, WalObserver, WalReader, WalRows, WalStatus, WalStatusListener, WalWriter,
+    WriterInit, WriterInitResult, WriterManifest,
 };
 use slatedb::{Db, DbReader, DbReaderMode, GarbageCollectorBuilder, RowEntry, VersionedManifest};
 
@@ -248,15 +248,13 @@ fn range_contains(range: &WalFileRange, wal_file_id: u64) -> bool {
 
 #[async_trait]
 impl WalGc for BTreeMapWal {
-    async fn collect(
-        &self,
-        referenced_ranges: Vec<WalFileRange>,
-        _min_age: Duration,
-        dry_run: bool,
-    ) -> Result<(), WalError> {
-        if !dry_run {
+    async fn collect(&self, request: WalGcRequest) -> Result<(), WalError> {
+        // This WAL has no fence markers, so only the WAL policy applies. It also ignores
+        // `min_age` because files carry no timestamps.
+        if request.wal.is_some_and(|policy| !policy.dry_run) {
             self.files.lock().retain(|wal_file_id, _| {
-                referenced_ranges
+                request
+                    .referenced_ranges
                     .iter()
                     .any(|range| range_contains(range, *wal_file_id))
             });

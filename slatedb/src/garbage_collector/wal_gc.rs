@@ -3,27 +3,29 @@ use crate::manifest::Manifest;
 use crate::{
     error::SlateDBError,
     manifest::store::ManifestStore,
-    wal::{WalFileRange, WalGc},
+    wal::{WalFileRange, WalGc, WalGcPolicy, WalGcRequest},
 };
 use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
-use std::time::Duration;
 
+/// Runs one or both WAL retention policies through a [`WalGc`]. When the WAL and WAL fence
+/// policies share a schedule, a single task carries both so the implementation can serve them
+/// from one scan.
 #[derive(Clone)]
 pub(crate) struct WalGcTask {
     manifest_store: Arc<ManifestStore>,
     wal_gc: Arc<dyn WalGc>,
-    resource: &'static str,
-    min_age: Duration,
-    dry_run: bool,
+    wal: Option<WalGcPolicy>,
+    fence: Option<WalGcPolicy>,
 }
 
 impl std::fmt::Debug for WalGcTask {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WalGcTask")
-            .field("resource", &self.resource.to_string())
+            .field("wal", &self.wal)
+            .field("fence", &self.fence)
             .finish()
     }
 }
@@ -32,16 +34,14 @@ impl WalGcTask {
     pub(super) fn new(
         manifest_store: Arc<ManifestStore>,
         wal_gc: Arc<dyn WalGc>,
-        resource: &'static str,
-        min_age: Duration,
-        dry_run: bool,
+        wal: Option<WalGcPolicy>,
+        fence: Option<WalGcPolicy>,
     ) -> Self {
         Self {
             manifest_store,
             wal_gc,
-            resource,
-            min_age,
-            dry_run,
+            wal,
+            fence,
         }
     }
 
@@ -83,13 +83,17 @@ impl GcTask for WalGcTask {
         let referenced_ranges = Self::referenced_wal_ranges(latest_manifest.id, &active_manifests);
 
         self.wal_gc
-            .collect(referenced_ranges, self.min_age, self.dry_run)
+            .collect(WalGcRequest::new(referenced_ranges, self.wal, self.fence))
             .await
             .map_err(Into::into)
     }
 
     fn resource(&self) -> &str {
-        self.resource
+        match (self.wal.is_some(), self.fence.is_some()) {
+            (true, true) => "WAL and WAL fence",
+            (false, true) => "WAL fence",
+            _ => "WAL",
+        }
     }
 }
 
@@ -111,24 +115,19 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingWalGc {
-        calls: Mutex<Vec<Vec<WalFileRange>>>,
+        calls: Mutex<Vec<WalGcRequest>>,
     }
 
     impl RecordingWalGc {
-        fn calls(&self) -> Vec<Vec<WalFileRange>> {
+        fn calls(&self) -> Vec<WalGcRequest> {
             self.calls.lock().unwrap().clone()
         }
     }
 
     #[async_trait]
     impl WalGc for RecordingWalGc {
-        async fn collect(
-            &self,
-            referenced_ranges: Vec<WalFileRange>,
-            _min_age: Duration,
-            _dry_run: bool,
-        ) -> Result<(), WalError> {
-            self.calls.lock().unwrap().push(referenced_ranges);
+        async fn collect(&self, request: WalGcRequest) -> Result<(), WalError> {
+            self.calls.lock().unwrap().push(request);
             Ok(())
         }
     }
@@ -158,7 +157,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_collect_calls_wal_gc_with_referenced_ranges() {
+    async fn test_collect_calls_wal_gc_with_ranges_and_policies() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let manifest_store = Arc::new(ManifestStore::new(
             &Path::from("/test/wal-gc-ranges"),
@@ -190,16 +189,28 @@ mod tests {
         stored_manifest.update(dirty).await.unwrap();
 
         let wal_gc = Arc::new(RecordingWalGc::default());
-        let task = WalGcTask::new(manifest_store, wal_gc.clone(), "WAL", Duration::ZERO, false);
+        let wal = WalGcPolicy {
+            min_age: Duration::ZERO,
+            dry_run: false,
+        };
+        let fence = WalGcPolicy {
+            min_age: Duration::from_secs(60),
+            dry_run: true,
+        };
+        let task = WalGcTask::new(manifest_store, wal_gc.clone(), Some(wal), Some(fence));
 
         task.collect(Utc::now()).await.unwrap();
 
+        let calls = wal_gc.calls();
+        assert_eq!(calls.len(), 1);
         assert_eq!(
-            wal_gc.calls(),
-            vec![vec![
+            calls[0].referenced_ranges,
+            vec![
                 WalFileRange(Bound::Excluded(2), Bound::Excluded(6)),
                 WalFileRange(Bound::Included(5), Bound::Unbounded),
-            ]]
+            ]
         );
+        assert_eq!(calls[0].wal, Some(wal));
+        assert_eq!(calls[0].fence, Some(fence));
     }
 }

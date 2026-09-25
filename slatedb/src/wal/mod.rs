@@ -295,21 +295,64 @@ pub trait WalReader: Send + Sync + 'static {
     async fn last_wal_file_id(&self, replay_after_wal_id: u64) -> Result<u64, WalError>;
 }
 
+/// Retention policy for one class of WAL object, taken from the garbage collector's options.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WalGcPolicy {
+    /// Objects must be older than this before they may be deleted.
+    pub min_age: Duration,
+    /// If true, the implementation should report what it would delete without deleting it.
+    pub dry_run: bool,
+}
+
+/// A single garbage collection pass over a WAL, passed to [`WalGc::collect`].
+///
+/// Each policy is `Some` only when the corresponding garbage collector option is enabled and
+/// scheduled for this pass. When both are present, the implementation should apply them from a
+/// single scan of its storage.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct WalGcRequest {
+    /// Ranges of WAL File IDs referenced by the current manifest or an active checkpoint. Files
+    /// and fence markers inside any of these ranges must not be deleted. The ranges apply to both
+    /// policies.
+    pub referenced_ranges: Vec<WalFileRange>,
+    /// Policy for WAL Files that hold data. Set from
+    /// [`GarbageCollectorOptions::wal_options`](crate::config::GarbageCollectorOptions::wal_options).
+    pub wal: Option<WalGcPolicy>,
+    /// Policy for fence markers, i.e. objects written during [`WriterInit::fence_and_init`] that
+    /// claim a WAL File ID without holding data. Set from
+    /// [`GarbageCollectorOptions::wal_fence_options`](crate::config::GarbageCollectorOptions::wal_fence_options),
+    /// which is enabled in dry-run mode by default.
+    ///
+    /// Implementations that persist fence markers as separate storage should apply this policy
+    /// to them. Implementations that don't should ignore it.
+    pub fence: Option<WalGcPolicy>,
+}
+
+impl WalGcRequest {
+    pub(crate) fn new(
+        referenced_ranges: Vec<WalFileRange>,
+        wal: Option<WalGcPolicy>,
+        fence: Option<WalGcPolicy>,
+    ) -> Self {
+        Self {
+            referenced_ranges,
+            wal,
+            fence,
+        }
+    }
+}
+
 /// Trait that defines the contract between SlateDB's garbage collector and a custom WAL
 /// implementation. SlateDB tracks the set of currently referenced WAL ranges in its manifest.
 /// When the Garbage Collector runs, it computes this set and calls [`WalGc::collect`] so that
 /// the implementation can clean up any un-referenced WAL storage.
 #[async_trait]
 pub trait WalGc: Send + Sync + 'static {
-    /// Hook for garbage collecting the WAL. Takes a list of ranges of WAL Files that are currently
-    /// referenced by some active Manifest. The implementation may delete any WAL File that is not
-    /// included in the ranges in this list.
-    async fn collect(
-        &self,
-        referenced_ranges: Vec<WalFileRange>,
-        min_age: Duration,
-        dry_run: bool,
-    ) -> Result<(), WalError>;
+    /// Hook for garbage collecting the WAL. The implementation may delete any WAL File or fence
+    /// marker that is outside [`WalGcRequest::referenced_ranges`] and allowed by the matching
+    /// policy in `request`. A `None` policy means that class of object must be left alone.
+    async fn collect(&self, request: WalGcRequest) -> Result<(), WalError>;
 }
 
 /// Administrative operations for a WAL implementation.
