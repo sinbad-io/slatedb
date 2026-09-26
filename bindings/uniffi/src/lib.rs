@@ -1,6 +1,7 @@
 mod admin;
 mod builder;
 mod cancellation;
+mod clock;
 mod config;
 mod db;
 mod db_cache;
@@ -26,6 +27,7 @@ mod write_handle;
 pub use admin::Admin;
 pub use builder::{AdminBuilder, CloneBuilder, DbBuilder, DbReaderBuilder};
 pub use cancellation::CancellationToken;
+pub use clock::SystemClock;
 pub use config::{
     CloseOptions, DurabilityLevel, FlushOptions, FlushType, GarbageCollectorDirectoryOptions,
     GarbageCollectorOptions, GarbageCollectorScheduleOptions, IsolationLevel, IterationOrder,
