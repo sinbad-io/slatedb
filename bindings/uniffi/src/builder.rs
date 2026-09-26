@@ -398,3 +398,35 @@ impl CloneBuilder {
         builder.build().await.map_err(Into::into)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db_cache::FoyerCacheOptions;
+
+    #[test]
+    fn reader_cache_hooks_retain_and_release_native_ownership() {
+        let cache = DbCache::new_foyer_cache(FoyerCacheOptions {
+            max_capacity: 64,
+            shards: 1,
+        })
+        .unwrap();
+        let object_store = Arc::new(ObjectStore {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+        });
+        let builder = DbReaderBuilder::new("db".to_owned(), object_store);
+        assert_eq!(Arc::strong_count(&cache.inner), 1);
+        builder.with_db_cache(cache.clone(), 1).unwrap();
+        assert_eq!(Arc::strong_count(&cache.inner), 2);
+        builder.with_db_cache_disabled().unwrap();
+        assert_eq!(Arc::strong_count(&cache.inner), 1);
+        builder.with_db_cache(cache.clone(), 1).unwrap();
+        let native = builder.take_builder().unwrap();
+        assert!(builder.with_db_cache(cache.clone(), 1).is_err());
+        assert!(builder.with_db_cache_disabled().is_err());
+        drop(builder);
+        assert_eq!(Arc::strong_count(&cache.inner), 2);
+        drop(native);
+        assert_eq!(Arc::strong_count(&cache.inner), 1);
+    }
+}
