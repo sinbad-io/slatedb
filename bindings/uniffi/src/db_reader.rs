@@ -120,6 +120,14 @@ impl DbReader {
     }
 
     // `shutdown` because `close` is reserved by uniffi for the destructor.
+    /// Refreshes this reader now and returns once it has installed the
+    /// persisted state: the newest manifest and, unless `skip_wal_replay`, the
+    /// WAL written since. It is the periodic poll, run on demand. A reader
+    /// pinned to a checkpoint is unchanged.
+    pub async fn refresh(&self) -> Result<(), Error> {
+        self.inner.refresh().await.map_err(Into::into)
+    }
+
     /// Closes the reader.
     #[uniffi::method(name = "shutdown")]
     pub async fn close(&self) -> Result<(), Error> {
@@ -174,5 +182,56 @@ impl DbReader {
     pub async fn flush_cache_to_disk(&self) -> Result<(), Error> {
         self.inner.flush_cache_to_disk().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builder::{DbBuilder, DbReaderBuilder};
+    use crate::config::{FlushOptions, FlushType, ReaderMode, ReaderOptions};
+    use crate::object_store::ObjectStore;
+
+    #[tokio::test]
+    async fn refresh_installs_a_durable_write_ahead_of_the_poll() {
+        let store = Arc::new(ObjectStore {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+        });
+        let db = DbBuilder::new("refresh".to_owned(), store.clone())
+            .build()
+            .await
+            .unwrap();
+        db.put(b"k".to_vec(), b"before".to_vec()).await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        let builder = DbReaderBuilder::new("refresh".to_owned(), store);
+        builder.with_reader_mode(ReaderMode::FollowLatest).unwrap();
+        builder
+            .with_options(ReaderOptions {
+                manifest_poll_interval_ms: 3_600_000,
+                ..ReaderOptions::default()
+            })
+            .unwrap();
+        let reader = builder.build().await.unwrap();
+        assert_eq!(
+            reader.get(b"k".to_vec()).await.unwrap(),
+            Some(b"before".to_vec())
+        );
+        let handle = db.put(b"k".to_vec(), b"after".to_vec()).await.unwrap();
+        handle.await_durable().await.unwrap();
+        assert_eq!(
+            reader.get(b"k".to_vec()).await.unwrap(),
+            Some(b"before".to_vec())
+        );
+        reader.refresh().await.unwrap();
+        assert_eq!(
+            reader.get(b"k".to_vec()).await.unwrap(),
+            Some(b"after".to_vec())
+        );
+        reader.close().await.unwrap();
+        db.close().await.unwrap();
     }
 }
