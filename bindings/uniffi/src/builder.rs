@@ -16,7 +16,7 @@ use crate::metrics::adapt_metrics_recorder;
 use crate::object_store::ObjectStore;
 use crate::runtime;
 use crate::settings::Settings;
-use crate::types::{CloneSourceSpec, KeyRange};
+use crate::types::{BlockCachePolicy, CloneSourceSpec, KeyRange};
 use crate::MetricsRecorder;
 use parking_lot::Mutex;
 
@@ -79,6 +79,13 @@ impl DbBuilder {
     /// uniqueness and stability across reopens.
     pub fn with_db_cache(&self, db_cache: Arc<DbCache>, db_cache_id: u64) -> Result<(), Error> {
         self.update_builder(|builder| builder.with_db_cache(db_cache.inner.clone(), db_cache_id))
+            .map_err(Into::into)
+    }
+
+    /// What the block cache keeps of the SSTs this database writes, on a
+    /// memtable flush and on a compaction's output.
+    pub fn with_block_cache_policy(&self, policy: BlockCachePolicy) -> Result<(), Error> {
+        self.update_builder(|builder| builder.with_block_cache_policy(policy.into_core()))
             .map_err(Into::into)
     }
 
@@ -525,6 +532,53 @@ mod tests {
         admin.with_system_clock(clock.clone()).unwrap();
         let _ = admin.take_builder().unwrap();
         assert!(admin.with_system_clock(clock).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_empty_flush_policy_caches_nothing_on_flush() {
+        use crate::config::{FlushOptions, FlushType};
+        use crate::db_cache::{DbCache, FoyerCacheOptions};
+        use crate::types::{BlockCachePolicy, CacheTarget};
+        let object_store = Arc::new(ObjectStore {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+        });
+        let weight_after_flush = |name: &str, policy: Option<BlockCachePolicy>| {
+            let object_store = object_store.clone();
+            let name = name.to_owned();
+            async move {
+                let cache = DbCache::new_bounded_foyer_cache(FoyerCacheOptions {
+                    max_capacity: 64 << 20,
+                    shards: 1,
+                })
+                .unwrap();
+                let builder = DbBuilder::new(name, object_store);
+                builder.with_db_cache(cache.clone(), 7).unwrap();
+                if let Some(policy) = policy {
+                    builder.with_block_cache_policy(policy).unwrap();
+                }
+                let db = builder.build().await.unwrap();
+                db.put(b"k".to_vec(), b"v".to_vec()).await.unwrap();
+                db.flush_with_options(FlushOptions {
+                    flush_type: FlushType::MemTable,
+                })
+                .await
+                .unwrap();
+                let weight = cache.indexed_weight().unwrap();
+                db.close().await.unwrap();
+                weight
+            }
+        };
+        let default = weight_after_flush("policy-default", None).await;
+        assert!(default > 0, "the default policy caches the flushed blocks");
+        let none = weight_after_flush(
+            "policy-empty",
+            Some(BlockCachePolicy {
+                flush_targets: vec![],
+                compaction_output_targets: vec![CacheTarget::Index],
+            }),
+        )
+        .await;
+        assert_eq!(none, 0, "an empty flush policy cached {none} bytes");
     }
 
     #[tokio::test]
