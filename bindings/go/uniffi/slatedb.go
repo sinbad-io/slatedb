@@ -1329,6 +1329,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_dbreader_snapshot()
+		})
+		if checksum != 8481 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreader_snapshot: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbreader_status()
 		})
 		if checksum != 4488 {
@@ -1343,6 +1352,33 @@ func uniffiCheckChecksums() {
 		if checksum != 4708 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreader_warm_sst: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_dbreadersnapshot_get()
+		})
+		if checksum != 54802 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreadersnapshot_get: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_dbreadersnapshot_scan_prefix_with_options()
+		})
+		if checksum != 16157 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreadersnapshot_scan_prefix_with_options: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_dbreadersnapshot_scan_with_options()
+		})
+		if checksum != 24561 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreadersnapshot_scan_with_options: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -5862,6 +5898,8 @@ type DbReaderInterface interface {
 	ScanWithOptions(varRange KeyRange, options ScanOptions) (*DbIterator, error)
 	// Closes the reader.
 	Shutdown() error
+	// This view holds the reader's installed state without creating a checkpoint.
+	Snapshot() (*DbReaderSnapshot, error)
 	// Returns the latest reader status snapshot.
 	Status() DbStatus
 	// Warms selected cache content for one SST.
@@ -6304,6 +6342,22 @@ func (_self *DbReader) Shutdown() error {
 	return err
 }
 
+// This view holds the reader's installed state without creating a checkpoint.
+func (_self *DbReader) Snapshot() (*DbReaderSnapshot, error) {
+	_pointer := _self.ffiObject.incrementPointer("*DbReader")
+	defer _self.ffiObject.decrementPointer()
+	_uniffiRV, _uniffiErr := rustCallWithError[*Error](FfiConverterError{}, func(_uniffiStatus *C.RustCallStatus) C.uint64_t {
+		return C.uniffi_slatedb_uniffi_fn_method_dbreader_snapshot(
+			_pointer, _uniffiStatus)
+	})
+	if _uniffiErr != nil {
+		var _uniffiDefaultValue *DbReaderSnapshot
+		return _uniffiDefaultValue, _uniffiErr
+	} else {
+		return FfiConverterDbReaderSnapshotINSTANCE.Lift(_uniffiRV), nil
+	}
+}
+
 // Returns the latest reader status snapshot.
 func (_self *DbReader) Status() DbStatus {
 	_pointer := _self.ffiObject.incrementPointer("*DbReader")
@@ -6689,6 +6743,174 @@ func LowerToExternalDbReaderBuilder(value *DbReaderBuilder) uint64 {
 type FfiDestroyerDbReaderBuilder struct{}
 
 func (_ FfiDestroyerDbReaderBuilder) Destroy(value *DbReaderBuilder) {
+	value.Destroy()
+}
+
+// One reader state across all operations, without a garbage-collection pin.
+type DbReaderSnapshotInterface interface {
+	Get(key []byte) (*[]byte, error)
+	ScanPrefixWithOptions(prefix []byte, subrange KeyRange, options ScanOptions) (*DbIterator, error)
+	ScanWithOptions(varRange KeyRange, options ScanOptions) (*DbIterator, error)
+}
+
+// One reader state across all operations, without a garbage-collection pin.
+type DbReaderSnapshot struct {
+	ffiObject FfiObject
+}
+
+func (_self *DbReaderSnapshot) Get(key []byte) (*[]byte, error) {
+	_pointer := _self.ffiObject.incrementPointer("*DbReaderSnapshot")
+	defer _self.ffiObject.decrementPointer()
+	res, err := uniffiRustCallAsync[*Error](
+		FfiConverterErrorINSTANCE,
+		// completeFn
+		func(handle C.uint64_t, status *C.RustCallStatus) RustBufferI {
+			res := C.ffi_slatedb_uniffi_rust_future_complete_rust_buffer(handle, status)
+			return GoRustBuffer{
+				inner: res,
+			}
+		},
+		// liftFn
+		func(ffi RustBufferI) *[]byte {
+			return FfiConverterOptionalBytesINSTANCE.Lift(ffi)
+		},
+		C.uniffi_slatedb_uniffi_fn_method_dbreadersnapshot_get(
+			_pointer, FfiConverterBytesINSTANCE.Lower(key)),
+		// pollFn
+		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_poll_rust_buffer(handle, continuation, data)
+		},
+		// freeFn
+		func(handle C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_free_rust_buffer(handle)
+		},
+	)
+
+	if err == nil {
+		return res, nil
+	}
+
+	return res, err
+}
+
+func (_self *DbReaderSnapshot) ScanPrefixWithOptions(prefix []byte, subrange KeyRange, options ScanOptions) (*DbIterator, error) {
+	_pointer := _self.ffiObject.incrementPointer("*DbReaderSnapshot")
+	defer _self.ffiObject.decrementPointer()
+	res, err := uniffiRustCallAsync[*Error](
+		FfiConverterErrorINSTANCE,
+		// completeFn
+		func(handle C.uint64_t, status *C.RustCallStatus) C.uint64_t {
+			res := C.ffi_slatedb_uniffi_rust_future_complete_u64(handle, status)
+			return res
+		},
+		// liftFn
+		func(ffi C.uint64_t) *DbIterator {
+			return FfiConverterDbIteratorINSTANCE.Lift(ffi)
+		},
+		C.uniffi_slatedb_uniffi_fn_method_dbreadersnapshot_scan_prefix_with_options(
+			_pointer, FfiConverterBytesINSTANCE.Lower(prefix), FfiConverterKeyRangeINSTANCE.Lower(subrange), FfiConverterScanOptionsINSTANCE.Lower(options)),
+		// pollFn
+		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_poll_u64(handle, continuation, data)
+		},
+		// freeFn
+		func(handle C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_free_u64(handle)
+		},
+	)
+
+	if err == nil {
+		return res, nil
+	}
+
+	return res, err
+}
+
+func (_self *DbReaderSnapshot) ScanWithOptions(varRange KeyRange, options ScanOptions) (*DbIterator, error) {
+	_pointer := _self.ffiObject.incrementPointer("*DbReaderSnapshot")
+	defer _self.ffiObject.decrementPointer()
+	res, err := uniffiRustCallAsync[*Error](
+		FfiConverterErrorINSTANCE,
+		// completeFn
+		func(handle C.uint64_t, status *C.RustCallStatus) C.uint64_t {
+			res := C.ffi_slatedb_uniffi_rust_future_complete_u64(handle, status)
+			return res
+		},
+		// liftFn
+		func(ffi C.uint64_t) *DbIterator {
+			return FfiConverterDbIteratorINSTANCE.Lift(ffi)
+		},
+		C.uniffi_slatedb_uniffi_fn_method_dbreadersnapshot_scan_with_options(
+			_pointer, FfiConverterKeyRangeINSTANCE.Lower(varRange), FfiConverterScanOptionsINSTANCE.Lower(options)),
+		// pollFn
+		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_poll_u64(handle, continuation, data)
+		},
+		// freeFn
+		func(handle C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_free_u64(handle)
+		},
+	)
+
+	if err == nil {
+		return res, nil
+	}
+
+	return res, err
+}
+func (object *DbReaderSnapshot) Destroy() {
+	runtime.SetFinalizer(object, nil)
+	object.ffiObject.destroy()
+}
+
+type FfiConverterDbReaderSnapshot struct{}
+
+var FfiConverterDbReaderSnapshotINSTANCE = FfiConverterDbReaderSnapshot{}
+
+func (c FfiConverterDbReaderSnapshot) Lift(handle C.uint64_t) *DbReaderSnapshot {
+	result := &DbReaderSnapshot{
+		newFfiObject(
+			handle,
+			func(handle C.uint64_t, status *C.RustCallStatus) C.uint64_t {
+				return C.uniffi_slatedb_uniffi_fn_clone_dbreadersnapshot(handle, status)
+			},
+			func(handle C.uint64_t, status *C.RustCallStatus) {
+				C.uniffi_slatedb_uniffi_fn_free_dbreadersnapshot(handle, status)
+			},
+		),
+	}
+	runtime.SetFinalizer(result, (*DbReaderSnapshot).Destroy)
+	return result
+}
+
+func (c FfiConverterDbReaderSnapshot) Read(reader io.Reader) *DbReaderSnapshot {
+	return c.Lift(C.uint64_t(readUint64(reader)))
+}
+
+func (c FfiConverterDbReaderSnapshot) Lower(value *DbReaderSnapshot) C.uint64_t {
+	// TODO: this is bad - all synchronization from ObjectRuntime.go is discarded here,
+	// because the handle will be decremented immediately after this function returns,
+	// and someone will be left holding onto a non-locked handle.
+	handle := value.ffiObject.incrementPointer("*DbReaderSnapshot")
+	defer value.ffiObject.decrementPointer()
+	return handle
+}
+
+func (c FfiConverterDbReaderSnapshot) Write(writer io.Writer, value *DbReaderSnapshot) {
+	writeUint64(writer, uint64(c.Lower(value)))
+}
+
+func LiftFromExternalDbReaderSnapshot(handle uint64) *DbReaderSnapshot {
+	return FfiConverterDbReaderSnapshotINSTANCE.Lift(C.uint64_t(handle))
+}
+
+func LowerToExternalDbReaderSnapshot(value *DbReaderSnapshot) uint64 {
+	return uint64(FfiConverterDbReaderSnapshotINSTANCE.Lower(value))
+}
+
+type FfiDestroyerDbReaderSnapshot struct{}
+
+func (_ FfiDestroyerDbReaderSnapshot) Destroy(value *DbReaderSnapshot) {
 	value.Destroy()
 }
 

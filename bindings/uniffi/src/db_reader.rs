@@ -22,6 +22,13 @@ impl DbReader {
 
 #[uniffi::export]
 impl DbReader {
+    /// This view holds the reader's installed state without creating a checkpoint.
+    pub fn snapshot(&self) -> Result<Arc<crate::DbReaderSnapshot>, Error> {
+        Ok(Arc::new(crate::DbReaderSnapshot::new(
+            self.inner.snapshot()?,
+        )))
+    }
+
     /// Returns the latest reader status snapshot.
     pub fn status(&self) -> DbStatus {
         self.inner.status().into()
