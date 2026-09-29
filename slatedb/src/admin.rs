@@ -37,6 +37,10 @@ use ulid::Ulid;
 use uuid::Uuid;
 
 pub use crate::db::builder::AdminBuilder;
+
+#[cfg(test)]
+mod object_metadata_tests;
+
 use crate::merge_operator::MergeOperatorType;
 use crate::wal::WalAdmin;
 use slatedb_txn_obj::TransactionalObject;
