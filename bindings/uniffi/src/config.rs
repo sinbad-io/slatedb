@@ -1,6 +1,8 @@
+use crate::cancellation::CancellationToken;
 use crate::error::{Error, SlateDbError};
 use crate::filter_policy::FilterContext;
 use crate::types::try_checkpoint_id_from_str;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Minimum durability level required for data returned by reads and scans.
@@ -150,6 +152,9 @@ pub struct ReadOptions {
     /// Optional caller-supplied tracing settings.
     #[uniffi(default = None)]
     pub tracing_options: Option<TracingOptions>,
+    /// Optional token for the original point call.
+    #[uniffi(default = None)]
+    pub cancellation_token: Option<Arc<CancellationToken>>,
 }
 
 impl Default for ReadOptions {
@@ -160,6 +165,7 @@ impl Default for ReadOptions {
             cache_blocks: true,
             filter_context: None,
             tracing_options: None,
+            cancellation_token: None,
         }
     }
 }
@@ -167,7 +173,7 @@ impl Default for ReadOptions {
 impl From<ReadOptions> for slatedb::config::ReadOptions {
     fn from(value: ReadOptions) -> Self {
         slatedb::config::ReadOptions {
-            cancellation_token: None,
+            cancellation_token: value.cancellation_token.map(|token| token.inner.clone()),
             durability_filter: value.durability_filter.into(),
             dirty: value.dirty,
             cache_blocks: value.cache_blocks,

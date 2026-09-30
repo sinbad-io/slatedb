@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::config::ScanOptions;
+use crate::config::{ReadOptions, ScanOptions};
 use crate::error::Error;
 use crate::iterator::DbIterator;
 use crate::types::KeyRange;
@@ -23,6 +23,20 @@ impl DbReaderSnapshot {
     pub async fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
         validate_key(&key)?;
         Ok(self.inner.get(key).await?.map(|value| value.to_vec()))
+    }
+
+    pub async fn get_with_options(
+        &self,
+        key: Vec<u8>,
+        options: ReadOptions,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        validate_key(&key)?;
+        let options = options.into();
+        Ok(self
+            .inner
+            .get_with_options(key, &options)
+            .await?
+            .map(|value| value.to_vec()))
     }
 
     pub async fn scan_with_options(

@@ -156,6 +156,10 @@ pub enum Error {
     /// Internal failure inside SlateDB or the binding layer.
     #[error("{message}")]
     Internal { message: String },
+
+    /// The caller cancelled the original point read.
+    #[error("{message}")]
+    Cancelled { message: String },
 }
 
 impl From<SlateDbError> for Error {
@@ -178,6 +182,7 @@ impl From<slatedb::Error> for Error {
             slatedb::ErrorKind::Invalid => Error::Invalid { message },
             slatedb::ErrorKind::Data => Error::Data { message },
             slatedb::ErrorKind::Internal => Error::Internal { message },
+            slatedb::ErrorKind::Cancelled => Error::Cancelled { message },
             _ => Error::Internal { message },
         }
     }

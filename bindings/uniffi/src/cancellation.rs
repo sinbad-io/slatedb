@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
-/// A handle that stops a foreground `Admin` loop such as `run_gc` or
-/// `run_compactor`. Cancelling is idempotent and may happen from any thread
-/// before or after the loop starts; a loop started with an already cancelled
-/// token shuts down at once.
-#[derive(uniffi::Object)]
+/// A handle that cancels a point read or a foreground `Admin` loop.
+/// Repeated cancellation is safe. It can occur before or during the call.
+#[derive(Debug, uniffi::Object)]
 pub struct CancellationToken {
     pub(crate) inner: tokio_util::sync::CancellationToken,
 }
@@ -18,7 +16,7 @@ impl CancellationToken {
         })
     }
 
-    /// Requests shutdown of every loop holding this token.
+    /// Requests cancellation of each read or loop that holds this token.
     pub fn cancel(&self) {
         self.inner.cancel();
     }
