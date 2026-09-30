@@ -73,3 +73,26 @@ The packet bounds remained 1200 seconds locally and 990 seconds remotely, with 9
 Evidence is under /private/tmp/om-fh-state/f/native-read-cancellation/native-point-behavior-k-v1/dispatch-20260930T122259Z-22473. The outer receipt is b565e764ecfa0399d60f6f80e35bbee0415de60ba9f686e81fc3645910f8b743. The worker receipt is 8952c72ae436d84382ace29c31e9d81c171105d3043a045f67918e8698f9cd66. The raw archive is c73b61e4465f500a54751176f803b699d9bcbf5eea711315180e4773b91ea64b. The compiler log is 441c923cde84672aee9493ddcbd088aa4e056361cc116df1b4f4db6268890d52. All seven transport logs and the original compiler log match their receipt hashes.
 
 The successor adds one explicit Cancelled-to-WalError::InternalError arm. The existing WAL error categories remain unchanged. Cancellation still applies only to point reads. The audit covers every tracked Rust ErrorKind reference. Display already handles Cancelled. CloseReason and UniFFI keep their existing fallback behavior. Neither the source audit nor this fix proves compilation or cancellation behavior.
+
+
+## Behavior attempt 2: partial timeout
+
+The WAL correction compiled. The v2 baseline was 25d1c363106a769ffa0a089eb39998f1b4180c41. The candidate was 31be743c07f49908a8fefc5a37820bf7320cd6ff. Compilation finished in 41.29 seconds, with no compiler error. The command then printed twelve FAILED parent lines. It did not finish the full test run.
+
+The exact command was:
+
+```sh
+/usr/bin/python3 /private/tmp/om-fh-state/f/native-read-cancellation/native-point-behavior-k-v2/dispatch-owned.py --root-authorized-slot
+```
+
+The command reached its unchanged 240-second cap during hybrid_point_read_preserves_observed_storage_error. The memory error parent did not start. Normal Rust capture did not flush the twelve failure details before interruption. Thus these parent lines do not prove the required named assertion failures. No isolated parent, candidate, legacy control, or omission ran. The candidate remains untested.
+
+Original Cargo138076 joined after TERM with exit -15. Its duration was 240.045077841 seconds, and its sampled group peak was 1,487,912,960 bytes. The worker owner138075 released at 12:38:25.016775Z. Its lock and owner inodes were [2049,3484497] and [2049,3484498]. Independent readback found the gate absent. Local original26965/session12957 and all seven transport children joined. Their IDs were 26967, 26988, 27001, 27550, 27568, 29391 and 29413.
+
+The worker took 242.057319548 seconds. The full dispatcher took 327.382194166 seconds. Both source inventories, Cargo.lock, Rust tools, canonical044, library16b51 and all four dependencies stayed unchanged. OOM stayed 0. K returned to the coordinator. No retry or deadline extension ran.
+
+The partial log does not contain an object-store latency measurement. Compilation and a fixture timeout do not compare with the napkin's 15–30ms GET rate. The actual 121765.887ms vector request debt remains unresolved.
+
+Evidence is under /private/tmp/om-fh-state/f/native-read-cancellation/native-point-behavior-k-v2/dispatch-20260930T123302Z-26965. The outer receipt is 1def3890fff0b61e4042790b997a6f73537146a0e5f997d3e22e32e98fc29511. The worker receipt is 7f5d26ec08d4b7c99586844f5059d814c8bdf9a2b08065f805d8b13d200d9fa9. The raw archive is 2de98fa82422217e03fe67f842f88c93c072028c455ee81d259dedb9e4154ae5. The command log is 39d2064fbac3fc9e9075814c35ff2e053b7902033c3dc1dd5d41ff516695ec45. All original log hashes match. PARTIAL-RESULT.json lists the twelve printed failures and the missing results.
+
+Source inspection found a fixture setup error. CancelErrorStore returns Generic on every armed range read. The default retry wrapper retries Generic without a limit. The fixture therefore withholds the terminal error that its assertion intends to inspect. The accepted successor sets object_store_max_retries to Some(0) only for the two error-precedence parents. This exposes one returned storage error without changing the production retry policy. The original 514 fixture lines and every behavior assertion remain intact.
