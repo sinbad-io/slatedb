@@ -12,11 +12,13 @@ const MAX_BATCH_PREALLOC: u32 = 1024;
 #[derive(uniffi::Object)]
 pub struct DbIterator {
     inner: Mutex<slatedb::DbIterator>,
+    cancellation_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl DbIterator {
     pub(crate) fn new(inner: slatedb::DbIterator) -> Self {
         Self {
+            cancellation_token: inner.cancellation_token(),
             inner: Mutex::new(inner),
         }
     }
@@ -24,6 +26,16 @@ impl DbIterator {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl DbIterator {
+    /// Cancel original work before waiting for an active call's mutex, then
+    /// join that call and every retained iterator child. Destroy alone is not
+    /// this asynchronous close. Repeated calls retain the original error.
+    pub async fn close(&self) -> Result<(), Error> {
+        if let Some(token) = &self.cancellation_token {
+            token.cancel();
+        }
+        self.inner.lock().await.close().await.map_err(Into::into)
+    }
+
     /// Returns the next key/value pair from the iterator.
     pub async fn next(&self) -> Result<Option<KeyValue>, Error> {
         let mut guard = self.inner.lock().await;

@@ -380,6 +380,9 @@ pub struct ScanOptions {
     /// Optional caller-supplied tracing settings.
     #[uniffi(default = None)]
     pub tracing_options: Option<TracingOptions>,
+    /// Retained for the whole iterator lifetime. Close cancels only its child.
+    #[uniffi(default = None)]
+    pub cancellation_token: Option<Arc<CancellationToken>>,
 }
 
 impl Default for ScanOptions {
@@ -393,6 +396,7 @@ impl Default for ScanOptions {
             order: None,
             filter_context: None,
             tracing_options: None,
+            cancellation_token: None,
         }
     }
 }
@@ -402,7 +406,7 @@ impl TryFrom<ScanOptions> for slatedb::config::ScanOptions {
 
     fn try_from(value: ScanOptions) -> Result<Self, Self::Error> {
         Ok(slatedb::config::ScanOptions {
-            cancellation_token: None,
+            cancellation_token: value.cancellation_token.map(|token| token.inner.clone()),
             durability_filter: value.durability_filter.into(),
             dirty: value.dirty,
             read_ahead_bytes: usize::try_from(value.read_ahead_bytes).map_err(|_| {
