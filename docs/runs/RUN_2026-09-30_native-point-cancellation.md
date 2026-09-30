@@ -168,3 +168,141 @@ Both source inventories, packet inputs, Cargo.lock, Rust tools, canonical044, li
 Evidence is under /private/tmp/om-fh-state/f/native-read-cancellation/native-point-behavior-k-v4/dispatch-20260930T125921Z-38917. The outer receipt is 6330905a0146518e39549eecdc59a9e866385d281808880b49211d1dfea33929. The worker receipt is 1c4999a752ddd275e729095fb720d7df16c5fa66526c0d322b7fe6d2d7342bfa. The raw archive is 00bfe10e14f9a66f591124fd25eaf1e6b1c2129d9a059aafd206c1ae9553fc8b. RESULTS.json records the separate candidate proof and retained baseline proof.
 
 This is the first passing native point behavior proof. Complete affected native tests, the Go token bridge, scan closure, library generation, fork publication, and the required shared roll remain separate. The old compiler failure, fixture timeout, and stale-artifact attempt remain recorded above. No public erasure or regional deadline acceptance follows from these results.
+
+## Remaining point-window boundary baseline
+
+Test-only native source `564ec174a114f455224346732b4091cac542576c` kept
+production `96674bce719249457073c245af168de4acdad102` unchanged. Packet
+`4af068b43f249dd31cc6ff146129c8604c33461c49cb9d35910b00fb2a34cdf9` selected
+only the sixteen new `multisource_boundary_` parents. The ten earlier lookup
+failures and their isolated receipts were retained rather than rerun.
+
+The first authorized transport attempt, original 98922/session 78688, passed
+its exact K identity and free-gate check, then its second SSH connection timed
+out before directory creation. No upload, remote gate, compiler or test ran.
+Both originals joined; receipt
+`5dcb7a59e6debb8f0360e8fb474bc6d1a0c1bbf7c3e03d77da158113e4609abb` remains
+a transport-only failure. The separately authorized exact three-source SSH
+repair was verified before the next named baseline grant. No test assertion
+or deadline was changed to address transport.
+
+The completed command was:
+
+```sh
+/usr/bin/python3 /private/tmp/om-fh-state/f/native-read-cancellation/multisource-boundary-baseline-k-v1/dispatch-owned.py --root-authorized-slot
+```
+
+All sixteen parents compiled. Four merge-rejection cases and four selected
+storage-error cases failed at their required original-cache-task join
+assertions. Each failed again alone with the same diagnostic. Four unused
+sibling-error cases preserved the selected value/tombstone; four ready-cache
+queued-source cases passed without opening sources outside the original
+window. No selected case was ignored. These distinguish physically started
+fixture tasks from queued-but-unpolled work; the fixture models the delivery
+boundary around actual Foyer calls, not a real disk stall.
+
+The original family command took 41.199411 seconds, with 39.91 seconds reported
+for compilation and 1.05 seconds for the tests. Peak sampled group RSS was
+1,513,418,752 bytes. The eight isolated commands each took 0.624709–0.632518
+seconds including Cargo startup. These local compile/held-fixture times are
+not latency measurements against the napkin 15–30ms object GET rate. The
+regional 121765.887ms request-budget overrun remains separate and unresolved.
+
+Local original 39720/session 40352 and all seven children joined. Worker owner
+166258 retained ten original Cargo groups; all joined and disappeared. The
+exact lock/owner inodes `[2049,3484497]` and `[2049,3484498]` released at
+17:32:12.078016Z after55.174651079 seconds. The local dispatcher took
+99.151986458 seconds. Limits remained 900 seconds local and 660 remote,
+including 90 seconds for cleanup. Independent readback found no worker gate.
+
+All 558 archived source files, Cargo.lock, Rust 1.91.1 tools, canonical044
+library 16b51 and its four dependencies stayed unchanged. OOM stayed 0. The
+initial library/integration artifacts were `fresh=false`; every isolated run
+used the same actual artifact hashes. All local/remote log hashes matched.
+No source, library, binding, Scan behavior, shared roll or erasure activation
+changed in this baseline. Candidate17e7451 remained a separate continuation.
+
+Evidence: `/private/tmp/om-fh-state/f/native-read-cancellation/multisource-boundary-baseline-k-v1/dispatch-20260930T173038Z-39720`.
+Outer receipt: `4111c23184e5ad6d5181b75e8bdc1acceea20b44d110492dc052d5424c2db3b8`.
+Worker receipt: `7211a36dbd2e302bd01e361f6fc6f36a1af7df5292a21029c38bfd8453143163`.
+Archive: `72fa7f0e94404e0d17d39adb951f9bc01f66c9c928f134e066f08dd82fa58f8b`.
+
+## Original point window candidate
+
+Candidate `17e7451c5c57abd3a23545be1894685ea78c0fc4` passed all forty point
+parents, nine existing GetIterator nodes, seven original inline controls and
+two original dedup controls. All 58 nodes passed; none failed or skipped.
+Four separately compiled omissions failed at their exact named assertions.
+This closes the tested original lookahead-task lifetime gap for point reads.
+It does not establish Scan cancellation, a Go bridge, or a regional deadline.
+
+The packet first rechecked the accepted sixteen-parent boundary receipt and
+all nine original family/isolated logs, with the same source and native pins.
+It retained the earlier ten-parent baseline independently. The exact command
+was:
+
+```sh
+/usr/bin/python3 /private/tmp/om-fh-state/f/native-read-cancellation/multisource-window-candidate-k-prepared/dispatch-owned.py --root-authorized-slot
+```
+
+Manifest: `3d688b3a2f0250f3bf219c7e02e770ef0c8f4eeaebf591ad12ec2840adc69f55`.
+Rust 1.91.1 ran locked/offline with 2 Cargo jobs and the foyer feature. Limits
+remained 1200s local and 990s remote, including 90s cleanup. Every source
+transition invalidated only slatedb artifacts in the same private target.
+The candidate library and integration executable each reported `fresh=false`
+from the exact candidate source; their actual output hashes are retained.
+The first lib-test build was also fresh, and later lib selections used that
+same executable. Dependency caches and installed native files were preserved.
+
+The point command took 42.041885s, reporting 37.95s compilation and 3.88s tests,
+with sampled group RSS 1,476,132,864 bytes. The GetIterator command took
+73.934148s including compilation, with 0.01s tests and peak 3,461,054,464 bytes.
+The inline and dedup commands took 1.049121s and 0.630701s respectively. The
+GetIterator census comprises five single tests plus four existing combinations
+of two booleans; a preparation-only function-count assertion was corrected
+before execution without changing a fixture or runtime assertion.
+
+Each omitted join was rebuilt separately. Removing hit joining, selected-error
+joining or merge-window joining returned before the held older original
+lookup joined. Reusing the caller token let unused-child cancellation escape
+to that original token. Each omission compiled, exited 101 and produced its
+required assertion; none was a compiler/setup failure. Each tested source
+mutation was restored after its original process joined, then the complete
+candidate inventory was rechecked.
+
+The concurrent fixture retained these raw observations:
+
+| Cache | Token | Object GETs | Held loaders | Elapsed microseconds | Next warm GETs |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Memory | Absent | 1 | 1 | 2159 | 0 |
+| Memory | Present | 4 | 4 | 1909 | 0 |
+| Hybrid | Absent | 1 | 1 | 2380 | 0 |
+| Hybrid | Present | 4 | 4 | 3408 | 0 |
+
+Four concurrent token readers still issue 4 GETs versus the legacy 1 GET. These
+1.909–3.408ms local held-store batches are below the napkin 15–30ms rate for
+a real object GET because the fixture is local. They do not show production
+latency neutrality or improved latency; the memory ordering is fixture noise.
+The held-cache control uses an original task around actual Foyer calls, not
+an actual physical disk stall. Cancellation still waits for an original
+cache lookup to finish. The observed 121765.887ms regional request, about 4.06
+times its 30s budget, remains an end-to-end acceptance debt.
+
+Local original 66913/session 42193 and seven original children joined. Worker
+167159 retained thirteen Cargo process groups, all joined/gone. It released
+its exact owner/inodes at 17:46:00.433274Z after 282.198959370s; the local
+dispatcher took 336.833596542s. Independent readback found the gate absent.
+All source inventories, Rust tools, canonical044/library 16b51 and four
+dependencies matched before/after; OOM stayed 0. Every local and remote
+command log matched its recorded hash. No retry or deadline extension ran.
+
+Evidence: `/private/tmp/om-fh-state/f/native-read-cancellation/multisource-window-candidate-k-prepared/dispatch-20260930T174031Z-66913`.
+Outer receipt: `ecb99230949abbc2f1583e6dc436eaa4e5694770562efcb94e4cbbc577b11f22`.
+Worker receipt: `1dd1495059beb8de085c2a13956534361c4daa34f89a130cc29377716224bf1c`.
+Raw archive: `e0bc31c5ff833ec5128bed4f376cee85cd752a4a3974ffea6057229062ad0b1b`.
+Independent summary: `54cb81c126679d3000a7e943a47a0ca549c408359a70a3989dfdb8c922db077c`.
+
+The next point prerequisites are a private library/generated binding with
+actual Go callback/reader error controls, full affected verification, fork
+publication and the separately locked shared roll. None ran in this packet.
+Scan lifetime and protected erasure/material receipt completion stay separate.
