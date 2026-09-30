@@ -1925,3 +1925,6 @@ async fn multisource_boundary_reader_ready_hit_does_not_start_queued_lookahead()
 async fn multisource_boundary_reader_snapshot_ready_hit_does_not_start_queued_lookahead() {
     ready_hit_does_not_start_queued_lookahead(true, true).await;
 }
+
+#[path = "point_read_cancellation/scan_coverage.rs"]
+mod scan_coverage;
