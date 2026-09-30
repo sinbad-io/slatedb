@@ -14,10 +14,12 @@ use crate::types::{KeyValue, RowEntry, ValueDeletable};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::future::{ready, BoxFuture, FutureExt};
+use futures::stream::{FuturesOrdered, StreamExt};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ops::RangeBounds;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 /// [`DbIteratorRangeTracker`] records the *requested* scan range of a
@@ -49,17 +51,62 @@ impl DbIteratorRangeTracker {
     }
 }
 
-/// Sources for a point lookup, in newest-first order.
-/// The stream initializes each source before it yields the source.
-///
-/// `Mutex` makes this stream `Sync`, as [`RowEntryIterator`] requires.
-/// The code accesses `Mutex` only through `get_mut`, so it never locks.
-type InitializedSources =
-    Mutex<BoxStream<'static, Result<Box<dyn RowEntryIterator + 'static>, SlateDBError>>>;
+type PointSource = Box<dyn RowEntryIterator + 'static>;
+type InitializedSource = Result<PointSource, SlateDBError>;
+
+// This is the original ordered window. Unselected sources stay outside it.
+struct InitializedSources {
+    remaining: std::vec::IntoIter<PointSource>,
+    pending: FuturesOrdered<BoxFuture<'static, InitializedSource>>,
+    lookahead: usize,
+    first: bool,
+}
+
+impl InitializedSources {
+    fn new(iters: Vec<PointSource>, lookahead: usize) -> Self {
+        Self {
+            remaining: iters.into_iter(),
+            pending: FuturesOrdered::new(),
+            lookahead: lookahead.max(1),
+            first: true,
+        }
+    }
+
+    async fn next(&mut self) -> Option<InitializedSource> {
+        let limit = if self.first { 1 } else { self.lookahead };
+        while self.pending.len() < limit {
+            let Some(mut iter) = self.remaining.next() else {
+                break;
+            };
+            self.pending
+                .push_back(async move { iter.init().await.map(|()| iter) }.boxed());
+        }
+        let result = self.pending.next().await;
+        self.first = false;
+        result
+    }
+
+    async fn finish_window(&mut self) {
+        let mut pending = std::mem::take(&mut self.pending);
+        while let Some(result) = pending.next().await {
+            self.pending.push_back(ready(result).boxed());
+        }
+    }
+
+    async fn stop(&mut self, join: bool) {
+        self.remaining = Vec::new().into_iter();
+        if join {
+            while self.pending.next().await.is_some() {}
+        } else {
+            self.pending = FuturesOrdered::new();
+        }
+    }
+}
 
 pub(crate) struct GetIterator {
     key: Bytes,
-    sources: InitializedSources,
+    sources: Mutex<InitializedSources>,
+    cancellation_token: Option<CancellationToken>,
     current: Option<Box<dyn RowEntryIterator + 'static>>,
 }
 
@@ -76,29 +123,23 @@ impl GetIterator {
         iters: Vec<Box<dyn RowEntryIterator + 'static>>,
         lookahead: usize,
     ) -> Self {
-        async fn init_source(
-            mut iter: Box<dyn RowEntryIterator + 'static>,
-        ) -> Result<Box<dyn RowEntryIterator + 'static>, SlateDBError> {
-            iter.init().await.map(|()| iter)
-        }
-
-        let mut iters = iters.into_iter();
-        let newest = iters.next();
-        let sources = stream::iter(newest)
-            .map(init_source)
-            .buffered(1)
-            .chain(
-                stream::iter(iters)
-                    .map(init_source)
-                    .buffered(lookahead.max(1)),
-            )
-            .boxed();
-
         Self {
             key,
-            sources: Mutex::new(sources),
+            sources: Mutex::new(InitializedSources::new(iters, lookahead)),
+            cancellation_token: None,
             current: None,
         }
+    }
+
+    async fn stop(&mut self) {
+        self.current = None;
+        if let Some(token) = &self.cancellation_token {
+            token.cancel();
+        }
+        self.sources
+            .get_mut()
+            .stop(self.cancellation_token.is_some())
+            .await;
     }
 
     pub(crate) fn new(
@@ -132,9 +173,9 @@ impl GetIterator {
     /// If a hit occurs after the newest source, the iterator can initialize up
     /// to `max_parallel - 1` extra sources. Each extra source reads a filter.
     /// If the filter is positive, the source also reads an index and one data
-    /// block. The iterator drops pending `init` calls when the walk stops. It
-    /// cannot stop the block fetches that those calls started, so the fetches
-    /// continue to completion.
+    /// block. A token read cancels its unused child work and joins the original
+    /// window before return. It does not admit another source during that join.
+    /// A legacy read keeps its existing drop behavior.
     ///
     /// `max_seq` is applied per leaf via `FilterIterator` so above-bound
     /// tombstones are dropped before the outer flat-walk encounters them
@@ -145,10 +186,19 @@ impl GetIterator {
         ctx: &SegmentScanContext,
         max_seq: Option<u64>,
     ) -> Result<Self, SlateDBError> {
-        let l0 = build_l0_point_iters(&tree.l0, ctx)?;
-        let sr = build_sr_point_iters(&key, &tree.compacted, ctx)?;
+        let mut context = ctx.clone();
+        let token = ctx
+            .sst_iter_options
+            .cancellation_token
+            .as_ref()
+            .map(CancellationToken::child_token);
+        context.sst_iter_options.cancellation_token = token.clone();
+        let l0 = build_l0_point_iters(&tree.l0, &context)?;
+        let sr = build_sr_point_iters(&key, &tree.compacted, &context)?;
         let iters = apply_filters(l0.into_iter().chain(sr), max_seq);
-        Ok(Self::with_lookahead(key, iters, ctx.max_parallel))
+        let mut iter = Self::with_lookahead(key, iters, ctx.max_parallel);
+        iter.cancellation_token = token;
+        Ok(iter)
     }
 }
 
@@ -166,25 +216,39 @@ impl RowEntryIterator for GetIterator {
         loop {
             if self.current.is_none() {
                 match self.sources.get_mut().next().await {
-                    Some(source) => self.current = Some(source?),
+                    Some(Ok(source)) => self.current = Some(source),
+                    Some(Err(error)) => {
+                        self.stop().await;
+                        return Err(error);
+                    }
                     None => return Ok(None),
                 }
             }
             let iter = self.current.as_mut().expect("source set above");
 
-            if let Some(entry) = iter.next().await? {
+            let entry = match iter.next().await {
+                Ok(entry) => entry,
+                Err(error) => {
+                    self.stop().await;
+                    return Err(error);
+                }
+            };
+            if let Some(entry) = entry {
                 match &entry.value {
                     ValueDeletable::Value(_) | ValueDeletable::Tombstone => {
                         // Merge operands need their base, but no older entries.
-                        // Drop the remaining sources and any pending initialization.
-                        self.current = None;
-                        *self.sources.get_mut() = stream::empty().boxed();
+                        // The token read joins its existing window before return.
+                        self.stop().await;
                         if entry.value.is_tombstone() {
                             return Ok(None);
                         }
                         return Ok(Some(entry));
                     }
                     ValueDeletable::Merge(_) => {
+                        // The outer merge callback can fail before it reads the base.
+                        if self.cancellation_token.is_some() {
+                            self.sources.get_mut().finish_window().await;
+                        }
                         return Ok(Some(entry));
                     }
                 }
