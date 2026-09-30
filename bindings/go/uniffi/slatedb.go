@@ -465,6 +465,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_admin_list_main_objects()
+		})
+		if checksum != 41660 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_admin_list_main_objects: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_admin_list_manifests()
 		})
 		if checksum != 13737 {
@@ -2565,6 +2574,10 @@ type AdminInterface interface {
 	ListCheckpoints(nameFilter *string) ([]Checkpoint, error)
 	// Lists compactions files inside the half-open ID range `[from, to)`.
 	ListCompactions(from *uint64, to *uint64) ([]VersionedCompactions, error)
+	// Lists metadata under this database's main-store prefix.
+	//
+	// A separate WAL and historical versions are outside this observation.
+	ListMainObjects() ([]ObjectMetadata, error)
 	// Lists manifests inside the half-open ID range `[from, to)`.
 	ListManifests(from *uint64, to *uint64) ([]VersionedManifest, error)
 	// Reads a compaction by ULID string from a specific or latest compactions file.
@@ -2866,6 +2879,44 @@ func (_self *Admin) ListCompactions(from *uint64, to *uint64) ([]VersionedCompac
 		},
 		C.uniffi_slatedb_uniffi_fn_method_admin_list_compactions(
 			_pointer, FfiConverterOptionalUint64INSTANCE.Lower(from), FfiConverterOptionalUint64INSTANCE.Lower(to)),
+		// pollFn
+		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_poll_rust_buffer(handle, continuation, data)
+		},
+		// freeFn
+		func(handle C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_free_rust_buffer(handle)
+		},
+	)
+
+	if err == nil {
+		return res, nil
+	}
+
+	return res, err
+}
+
+// Lists metadata under this database's main-store prefix.
+//
+// A separate WAL and historical versions are outside this observation.
+func (_self *Admin) ListMainObjects() ([]ObjectMetadata, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Admin")
+	defer _self.ffiObject.decrementPointer()
+	res, err := uniffiRustCallAsync[*Error](
+		FfiConverterErrorINSTANCE,
+		// completeFn
+		func(handle C.uint64_t, status *C.RustCallStatus) RustBufferI {
+			res := C.ffi_slatedb_uniffi_rust_future_complete_rust_buffer(handle, status)
+			return GoRustBuffer{
+				inner: res,
+			}
+		},
+		// liftFn
+		func(ffi RustBufferI) []ObjectMetadata {
+			return FfiConverterSequenceObjectMetadataINSTANCE.Lift(ffi)
+		},
+		C.uniffi_slatedb_uniffi_fn_method_admin_list_main_objects(
+			_pointer),
 		// pollFn
 		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
 			C.ffi_slatedb_uniffi_rust_future_poll_rust_buffer(handle, continuation, data)
@@ -16632,6 +16683,53 @@ type FfiDestroyerSequenceMetricLabel struct{}
 func (FfiDestroyerSequenceMetricLabel) Destroy(sequence []MetricLabel) {
 	for _, value := range sequence {
 		FfiDestroyerMetricLabel{}.Destroy(value)
+	}
+}
+
+type FfiConverterSequenceObjectMetadata struct{}
+
+var FfiConverterSequenceObjectMetadataINSTANCE = FfiConverterSequenceObjectMetadata{}
+
+func (c FfiConverterSequenceObjectMetadata) Lift(rb RustBufferI) []ObjectMetadata {
+	return LiftFromRustBuffer[[]ObjectMetadata](c, rb)
+}
+
+func (c FfiConverterSequenceObjectMetadata) Read(reader io.Reader) []ObjectMetadata {
+	length := readInt32(reader)
+	if length == 0 {
+		return nil
+	}
+	result := make([]ObjectMetadata, 0, length)
+	for i := int32(0); i < length; i++ {
+		result = append(result, FfiConverterObjectMetadataINSTANCE.Read(reader))
+	}
+	return result
+}
+
+func (c FfiConverterSequenceObjectMetadata) Lower(value []ObjectMetadata) C.RustBuffer {
+	return LowerIntoRustBuffer[[]ObjectMetadata](c, value)
+}
+
+func (c FfiConverterSequenceObjectMetadata) LowerExternal(value []ObjectMetadata) ExternalCRustBuffer {
+	return RustBufferFromC(LowerIntoRustBuffer[[]ObjectMetadata](c, value))
+}
+
+func (c FfiConverterSequenceObjectMetadata) Write(writer io.Writer, value []ObjectMetadata) {
+	if len(value) > math.MaxInt32 {
+		panic("[]ObjectMetadata is too large to fit into Int32")
+	}
+
+	writeInt32(writer, int32(len(value)))
+	for _, item := range value {
+		FfiConverterObjectMetadataINSTANCE.Write(writer, item)
+	}
+}
+
+type FfiDestroyerSequenceObjectMetadata struct{}
+
+func (FfiDestroyerSequenceObjectMetadata) Destroy(sequence []ObjectMetadata) {
+	for _, value := range sequence {
+		FfiDestroyerObjectMetadata{}.Destroy(value)
 	}
 }
 

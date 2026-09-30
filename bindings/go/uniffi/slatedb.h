@@ -702,6 +702,11 @@ uint64_t uniffi_slatedb_uniffi_fn_method_admin_list_checkpoints(uint64_t ptr, Ru
 uint64_t uniffi_slatedb_uniffi_fn_method_admin_list_compactions(uint64_t ptr, RustBuffer from, RustBuffer to
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SLATEDB_UNIFFI_FN_METHOD_ADMIN_LIST_MAIN_OBJECTS
+#define UNIFFI_FFIDEF_UNIFFI_SLATEDB_UNIFFI_FN_METHOD_ADMIN_LIST_MAIN_OBJECTS
+uint64_t uniffi_slatedb_uniffi_fn_method_admin_list_main_objects(uint64_t ptr
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_SLATEDB_UNIFFI_FN_METHOD_ADMIN_LIST_MANIFESTS
 #define UNIFFI_FFIDEF_UNIFFI_SLATEDB_UNIFFI_FN_METHOD_ADMIN_LIST_MANIFESTS
 uint64_t uniffi_slatedb_uniffi_fn_method_admin_list_manifests(uint64_t ptr, RustBuffer from, RustBuffer to
@@ -2369,6 +2374,12 @@ uint16_t uniffi_slatedb_uniffi_checksum_method_admin_list_checkpoints(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_SLATEDB_UNIFFI_CHECKSUM_METHOD_ADMIN_LIST_COMPACTIONS
 #define UNIFFI_FFIDEF_UNIFFI_SLATEDB_UNIFFI_CHECKSUM_METHOD_ADMIN_LIST_COMPACTIONS
 uint16_t uniffi_slatedb_uniffi_checksum_method_admin_list_compactions(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SLATEDB_UNIFFI_CHECKSUM_METHOD_ADMIN_LIST_MAIN_OBJECTS
+#define UNIFFI_FFIDEF_UNIFFI_SLATEDB_UNIFFI_CHECKSUM_METHOD_ADMIN_LIST_MAIN_OBJECTS
+uint16_t uniffi_slatedb_uniffi_checksum_method_admin_list_main_objects(void
     
 );
 #endif

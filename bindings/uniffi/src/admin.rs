@@ -5,7 +5,7 @@ use crate::error::{Error, SlateDbError};
 use crate::settings::Settings;
 use crate::types::{
     try_checkpoint_id_from_str, Checkpoint, CheckpointCreateResult, CloneSourceSpec, Compaction,
-    CompactionSpec, CompactorStateView, VersionedCompactions, VersionedManifest,
+    CompactionSpec, CompactorStateView, ObjectMetadata, VersionedCompactions, VersionedManifest,
 };
 use chrono::{DateTime, Utc};
 use std::ops::Bound;
@@ -31,6 +31,19 @@ pub struct Admin {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Admin {
+    /// Lists metadata under this database's main-store prefix.
+    ///
+    /// A separate WAL and historical versions are outside this observation.
+    pub async fn list_main_objects(&self) -> Result<Vec<ObjectMetadata>, Error> {
+        Ok(self
+            .inner
+            .list_main_objects()
+            .await?
+            .into_iter()
+            .map(ObjectMetadata::from)
+            .collect())
+    }
+
     /// Reads a specific manifest by ID, or the latest when `id` is `None`.
     pub async fn read_manifest(&self, id: Option<u64>) -> Result<Option<VersionedManifest>, Error> {
         let manifest = self.inner.read_manifest(id).await?;
