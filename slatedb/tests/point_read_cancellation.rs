@@ -1069,7 +1069,7 @@ impl DbCache for LookaheadCache {
     }
 }
 
-async fn lookahead_store(tombstone: bool) -> Arc<dyn ObjectStore> {
+async fn lookahead_store(tombstone: bool, extra_older: usize) -> Arc<dyn ObjectStore> {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let seed = Db::builder("point-cancellation", store.clone())
         .with_settings(settings())
@@ -1077,12 +1077,14 @@ async fn lookahead_store(tombstone: bool) -> Arc<dyn ObjectStore> {
         .build()
         .await
         .unwrap();
-    seed.put(KEY, b"old-value").await.unwrap();
-    seed.flush_with_options(FlushOptions {
-        flush_type: FlushType::MemTable,
-    })
-    .await
-    .unwrap();
+    for _ in 0..=extra_older {
+        seed.put(KEY, b"old-value").await.unwrap();
+        seed.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+    }
     if tombstone {
         seed.delete(KEY).await.unwrap();
     } else {
@@ -1110,6 +1112,7 @@ async fn point_joins_started_lookahead(
     snapshot: bool,
     cancel: bool,
     tombstone: bool,
+    extra_older: usize,
 ) {
     let directory = TempDir::new().unwrap();
     let inner = cache(true, directory.path()).await;
@@ -1122,7 +1125,7 @@ async fn point_joins_started_lookahead(
         original: std::sync::Mutex::new(None),
     });
     let db = open_original(
-        lookahead_store(tombstone).await,
+        lookahead_store(tombstone, extra_older).await,
         cache.clone(),
         reader,
         Some(0),
@@ -1131,8 +1134,8 @@ async fn point_joins_started_lookahead(
     let manifest = db.manifest();
     assert_eq!(
         manifest.l0().len(),
-        3,
-        "fixture requires three original L0 tables"
+        3 + extra_older,
+        "fixture lost an original L0 table"
     );
     for table in manifest.l0() {
         db.warm_sst(table.sst.id, &[CacheTarget::Filters, CacheTarget::Index])
@@ -1212,13 +1215,16 @@ async fn point_joins_started_lookahead(
     );
     assert_eq!(
         filters.len(),
-        3,
-        "fixture did not visit exactly three filters"
+        (3 + extra_older).min(5),
+        "point lookup started sources outside its original lookahead window"
     );
-    assert!(
-        filters[0] != filters[1] && filters[0] != filters[2] && filters[1] != filters[2],
-        "fixture revisited a filter instead of starting three original sources"
+    let distinct: std::collections::HashSet<_> = filters.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        filters.len(),
+        "fixture revisited an original filter"
     );
+
     assert_eq!(
         active_before_release, 1,
         "older original lookup did not remain held"
@@ -1253,45 +1259,50 @@ async fn point_joins_started_lookahead(
 
 #[tokio::test]
 async fn writer_hit_joins_started_lookahead() {
-    point_joins_started_lookahead(false, false, false, false).await;
+    point_joins_started_lookahead(false, false, false, false, 0).await;
 }
 
 #[tokio::test]
 async fn writer_snapshot_hit_joins_started_lookahead() {
-    point_joins_started_lookahead(false, true, false, false).await;
+    point_joins_started_lookahead(false, true, false, false, 0).await;
 }
 
 #[tokio::test]
 async fn reader_hit_joins_started_lookahead() {
-    point_joins_started_lookahead(true, false, false, false).await;
+    point_joins_started_lookahead(true, false, false, false, 0).await;
 }
 
 #[tokio::test]
 async fn reader_snapshot_hit_joins_started_lookahead() {
-    point_joins_started_lookahead(true, true, false, false).await;
+    point_joins_started_lookahead(true, true, false, false, 0).await;
 }
 
 #[tokio::test]
 async fn writer_cancellation_joins_started_lookahead() {
-    point_joins_started_lookahead(false, false, true, false).await;
+    point_joins_started_lookahead(false, false, true, false, 0).await;
 }
 
 #[tokio::test]
 async fn writer_snapshot_cancellation_joins_started_lookahead() {
-    point_joins_started_lookahead(false, true, true, false).await;
+    point_joins_started_lookahead(false, true, true, false, 0).await;
 }
 
 #[tokio::test]
 async fn reader_cancellation_joins_started_lookahead() {
-    point_joins_started_lookahead(true, false, true, false).await;
+    point_joins_started_lookahead(true, false, true, false, 0).await;
 }
 
 #[tokio::test]
 async fn reader_snapshot_cancellation_joins_started_lookahead() {
-    point_joins_started_lookahead(true, true, true, false).await;
+    point_joins_started_lookahead(true, true, true, false, 0).await;
 }
 
 #[tokio::test]
 async fn writer_tombstone_joins_started_lookahead() {
-    point_joins_started_lookahead(false, false, false, true).await;
+    point_joins_started_lookahead(false, false, false, true, 0).await;
+}
+
+#[tokio::test]
+async fn writer_hit_joins_started_lookahead_without_opening_the_rest() {
+    point_joins_started_lookahead(false, false, false, false, 3).await;
 }
