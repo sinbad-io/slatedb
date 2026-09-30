@@ -1067,6 +1067,60 @@ mod tests {
         assert!(txn1.commit().await.is_err());
     }
 
+    // Explicit iterator close must release its original I/O, not the
+    // transaction's read dependency on the complete requested range.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_txn_ssi_scan_close_keeps_requested_range(
+        #[values(false, true)] cancellable: bool,
+        #[values(false, true)] write_inside: bool,
+    ) {
+        let db = crate::Db::open("scan_close_ssi", Arc::new(InMemory::new()))
+            .await
+            .unwrap();
+        db.put(b"k_mid", b"original").await.unwrap();
+        db.flush().await.unwrap();
+        let txn = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        let parent = tokio_util::sync::CancellationToken::new();
+        let options = ScanOptions {
+            cancellation_token: cancellable.then(|| parent.clone()),
+            ..ScanOptions::default()
+        };
+        let mut iter = txn
+            .scan_with_options(&b"k_a"[..]..&b"k_z"[..], &options)
+            .await
+            .unwrap();
+        iter.seek(b"k_mid").await.unwrap();
+        assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"k_mid");
+        // Stop before EOF. A write before the seek target still conflicts.
+        iter.close().await.unwrap();
+        iter.close().await.unwrap();
+        let key: &[u8] = if write_inside {
+            b"k_before"
+        } else {
+            b"outside"
+        };
+        db.put(key, b"concurrent").await.unwrap();
+        txn.put(b"txn_marker", b"write").unwrap();
+        let committed = txn.commit().await;
+        db.close().await.unwrap();
+        assert!(
+            !parent.is_cancelled(),
+            "closing a scan canceled its transaction caller"
+        );
+        if write_inside {
+            assert!(
+                matches!(committed, Err(ref error) if matches!(error.kind(), crate::ErrorKind::Transaction)),
+                "{committed:?}"
+            );
+        } else {
+            committed.unwrap();
+        }
+    }
+
     /// A tombstone that sits inside a scan's requested range causes
     /// `DbIterator::next_entry` to skip the key, so the caller sees an
     /// "absent" observation. A concurrent resurrect of that key is therefore

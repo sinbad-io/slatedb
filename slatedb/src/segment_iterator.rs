@@ -1107,6 +1107,203 @@ mod tests {
         );
     }
 
+    struct HeldSegmentClose {
+        record: Arc<RangeBuildProbe>,
+    }
+
+    #[async_trait]
+    impl RowEntryIterator for HeldSegmentClose {
+        async fn init(&mut self) -> Result<(), SlateDBError> {
+            Ok(())
+        }
+        async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+            Ok(None)
+        }
+        async fn seek(&mut self, _: &[u8]) -> Result<(), SlateDBError> {
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<(), SlateDBError> {
+            self.record.held.store(true, Ordering::SeqCst);
+            self.record.changed.notify_waiters();
+            self.record.wait(&self.record.released).await;
+            self.record.joined.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    // This proves the existing iterator owner edge. The held Close is a
+    // fixture callback. The untouched Pending child uses a real TableStore.
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_segment_close_joins_built_and_drops_unopened_pending() {
+        segment_retirement("close").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_segment_seek_joins_built_and_skips_unopened_pending() {
+        segment_retirement("seek").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_segment_eof_joins_before_opening_pending() {
+        segment_retirement("eof").await;
+    }
+
+    async fn segment_retirement(action: &str) {
+        use crate::block_cache_policy::BlockCachePolicy;
+        use crate::db_state::SsTableId;
+        use crate::format::sst::SsTableFormat;
+        use crate::tablestore::TableStoreKind;
+        use slatedb_common::metrics::{DefaultMetricsRecorder, MetricLevel, MetricsRecorderHelper};
+        let ids: Vec<_> = (1..=3)
+            .map(|id| SsTableId::from(ulid::Ulid::from_parts(id, 0)))
+            .collect();
+        let record = Arc::new(RangeBuildProbe::default());
+        let cache = Arc::new(RangeBuildCache {
+            inner: crate::db_cache::test_utils::TestCache::new(),
+            record: record.clone(),
+            failure: ids[1],
+            held: ids[2],
+            unopened: vec![ids[0]],
+            unwanted: AtomicUsize::new(0),
+            point_cleanup: false,
+        });
+        let table_store = Arc::new(TableStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            SsTableFormat::default(),
+            object_store::path::Path::from("scan-pending-owner"),
+            Some(cache.clone()),
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        ));
+        let mut writer = table_store.table_writer(ids[0], Some(Bytes::from_static(b"b/")));
+        writer
+            .add(RowEntry::new_value(b"b/1", b"pending", 1))
+            .await
+            .unwrap();
+        let tree = Arc::new(LsmTreeState {
+            l0: VecDeque::from([SsTableView::identity(writer.close().await.unwrap().0)]),
+            ..LsmTreeState::default()
+        });
+        let helper = MetricsRecorderHelper::new(
+            Arc::new(DefaultMetricsRecorder::new()),
+            MetricLevel::default(),
+        );
+        let context = SegmentScanContext {
+            table_store,
+            range: BytesRange::from(..),
+            max_parallel: 1,
+            sst_iter_options: SstIteratorOptions::default(),
+            point_lookup_stats: None,
+            db_stats: DbStats::new(&helper),
+            read_trace: ReadTrace::new(None),
+        };
+        let tail_record = Arc::new(RangeBuildProbe::default());
+        let mut iter = SegmentMergeIterator {
+            children: VecDeque::from([
+                (
+                    Bytes::from_static(b"a/"),
+                    SegmentIterState::Built(Box::new(HeldSegmentClose {
+                        record: record.clone(),
+                    })),
+                ),
+                (
+                    Bytes::from_static(b"b/"),
+                    SegmentIterState::Pending(tree.clone()),
+                ),
+                (
+                    Bytes::from_static(b"c/"),
+                    SegmentIterState::Built(Box::new(BuiltRangeProbe {
+                        record: tail_record.clone(),
+                        entry: Some(entry(b"c/1", b"tail", 1)),
+                    })),
+                ),
+            ]),
+            context: Some(context.clone()),
+            order: IterationOrder::Ascending,
+            pending_seek: None,
+            initialized: true,
+        };
+        let mut original = Box::pin(async {
+            match action {
+                "close" => iter.close().await.map(|()| None),
+                "seek" => iter.seek(b"c/1").await.map(|()| None),
+                "eof" => iter.next().await,
+                _ => unreachable!(),
+            }
+        });
+        let first = futures::poll!(original.as_mut());
+        let returned_early = first.is_ready();
+        let held = record.held.load(Ordering::SeqCst);
+        let reads_while_held = cache.unwanted.load(Ordering::SeqCst);
+        let tail_closes_while_held = tail_record.closed.load(Ordering::SeqCst);
+        record.release();
+        let result = match first {
+            std::task::Poll::Ready(result) => Ok(result),
+            std::task::Poll::Pending => {
+                tokio::time::timeout(Duration::from_secs(2), original.as_mut()).await
+            }
+        };
+        drop(original);
+        let next = if action == "seek" && matches!(&result, Ok(Ok(_))) {
+            iter.next().await
+        } else {
+            Ok(None)
+        };
+        let closed = iter.close().await;
+        let reads_after = cache.unwanted.load(Ordering::SeqCst);
+        // An actual positive control shows that this exact Pending tree can
+        // open. No missing context or deliberately invalid SST is the sentinel.
+        let probe =
+            RangeTreeIterators::build(&tree, &context.for_segment(&Bytes::from_static(b"b/")))
+                .await;
+        let mut probe = probe.unwrap();
+        for child in probe.l0.iter_mut().chain(&mut probe.sr) {
+            child.close().await.unwrap();
+        }
+        closed.unwrap();
+        assert!(held, "the original Close callback was never entered");
+        assert!(
+            !returned_early,
+            "retirement returned before the original child joined"
+        );
+        assert_eq!(
+            reads_while_held, 0,
+            "Pending was promoted before original Close joined"
+        );
+        assert_eq!(
+            tail_closes_while_held, 0,
+            "tail ownership was released out of order"
+        );
+        assert_eq!(record.joined.load(Ordering::SeqCst), 1);
+        assert_eq!(tail_record.closed.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            Arc::strong_count(&tree),
+            1,
+            "closed iterator retained the Pending owner"
+        );
+        assert!(
+            cache.unwanted.load(Ordering::SeqCst) > reads_after,
+            "positive Pending promotion made no lookup"
+        );
+        let returned = result.unwrap().unwrap();
+        if action == "eof" {
+            assert_eq!(returned.unwrap().key.as_ref(), b"b/1");
+            assert!(
+                reads_after > 0,
+                "EOF never promoted the next original child"
+            );
+        } else {
+            assert!(returned.is_none());
+            assert_eq!(
+                reads_after, 0,
+                "Close/Seek initialized an untouched Pending owner"
+            );
+        }
+        if action == "seek" {
+            assert_eq!(next.unwrap().unwrap().key.as_ref(), b"c/1");
+        }
+    }
+
     /// Vec-backed iterator over fixed RowEntries. `seek` discards
     /// entries on the already-emitted side of `next_key` according to
     /// the configured order.

@@ -1399,7 +1399,7 @@ fn block_fetch_panic_error(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::block_cache_policy::BlockCachePolicy;
     use crate::bytes_generator::OrderedBytesGenerator;
@@ -4036,17 +4036,27 @@ mod tests {
         assert!(iter.next().await.unwrap().is_none());
     }
 
-    struct ScanReadCache {
+    pub(crate) struct ScanReadCache {
         inner: TestCache,
         offset: std::sync::atomic::AtomicU64,
         started: std::sync::atomic::AtomicUsize,
+        index_calls: std::sync::atomic::AtomicUsize,
         dropped: Arc<std::sync::atomic::AtomicUsize>,
         released: std::sync::atomic::AtomicBool,
         changed: tokio::sync::Notify,
     }
 
     impl ScanReadCache {
-        fn release(&self) {
+        pub(crate) fn counts(&self) -> (usize, usize, usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            (
+                self.started.load(SeqCst),
+                self.dropped.load(SeqCst),
+                self.index_calls.load(SeqCst),
+            )
+        }
+
+        pub(crate) fn release(&self) {
             self.released
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             self.changed.notify_waiters();
@@ -4088,6 +4098,8 @@ mod tests {
             &self,
             key: &crate::db_cache::CachedKey,
         ) -> Result<Option<crate::db_cache::CachedEntry>, crate::Error> {
+            self.index_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.get_index(key).await
         }
         async fn get_filter(
@@ -4117,7 +4129,17 @@ mod tests {
         }
     }
 
-    async fn held_scan_prefetch() -> (
+    pub(crate) fn scan_fixture_parts(
+        iter: &SstIterator<'_>,
+    ) -> (Arc<TableStore>, SstIteratorOptions) {
+        let inner = match &iter.delegate {
+            SstIteratorDelegate::Direct(inner) => inner,
+            SstIteratorDelegate::Filter(filtered) => &filtered.inner,
+        };
+        (inner.table_store.clone(), inner.options.clone())
+    }
+
+    pub(crate) async fn held_scan_prefetch() -> (
         SstIterator<'static>,
         Arc<ScanReadCache>,
         tokio_util::sync::CancellationToken,
@@ -4128,6 +4150,7 @@ mod tests {
             inner: TestCache::new(),
             offset: AtomicU64::new(u64::MAX),
             started: AtomicUsize::new(0),
+            index_calls: AtomicUsize::new(0),
             dropped: Arc::new(AtomicUsize::new(0)),
             released: AtomicBool::new(false),
             changed: tokio::sync::Notify::new(),
@@ -4212,7 +4235,7 @@ mod tests {
         (iter, cache, parent, originals)
     }
 
-    async fn settle_scan_fixture_tasks(originals: &[tokio::task::AbortHandle]) {
+    pub(crate) async fn settle_scan_fixture_tasks(originals: &[tokio::task::AbortHandle]) {
         let complete = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while originals.iter().any(|task| !task.is_finished()) {
                 tokio::task::yield_now().await;

@@ -1336,3 +1336,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod scan_ownership_tests;
