@@ -140,7 +140,22 @@ async fn main_object_observation_keeps_every_metadata_field() {
 
     let mut observed = admin.list_main_objects().await.unwrap();
     observed.sort_by(|a, b| a.location.cmp(&b.location));
-    let mut expected = vec![ObjectMetadata::new(first), ObjectMetadata::new(second)];
+    let mut expected = vec![
+        ObjectMetadata {
+            location: Path::from("tenant/cell/data/first.sst"),
+            last_modified: DateTime::<Utc>::from_timestamp(1_700_000_000, 123_456_789).unwrap(),
+            size: 4_294_967_314,
+            e_tag: Some("etag-unchanged".to_owned()),
+            version: Some("generation-7".to_owned()),
+        },
+        ObjectMetadata {
+            location: Path::from("tenant/cell/wal/second.sst"),
+            last_modified: DateTime::<Utc>::from_timestamp(1_700_000_000, 123_456_789).unwrap(),
+            size: 0,
+            e_tag: None,
+            version: None,
+        },
+    ];
     expected.sort_by(|a, b| a.location.cmp(&b.location));
     assert_eq!(observed, expected);
 }
