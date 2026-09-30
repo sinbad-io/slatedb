@@ -4427,4 +4427,63 @@ mod tests {
         assert_eq!(cache.started.load(SeqCst), 1);
         assert_eq!(cache.dropped.load(SeqCst), 1);
     }
+
+    struct ScanInitError;
+
+    #[async_trait]
+    impl RowEntryIterator for ScanInitError {
+        async fn init(&mut self) -> Result<(), SlateDBError> {
+            Err(SlateDBError::IoError(Arc::new(std::io::Error::other(
+                "scan child initialization failed",
+            ))))
+        }
+
+        async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+            panic!("failed initializer must never be read")
+        }
+
+        async fn seek(&mut self, _: &[u8]) -> Result<(), SlateDBError> {
+            panic!("failed initializer must never be sought")
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_merge_init_error_joins_original_prefetch() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (iter, cache, parent, originals) = held_scan_prefetch().await;
+        let children: Vec<Box<dyn RowEntryIterator>> =
+            vec![Box::new(iter), Box::new(ScanInitError)];
+        let mut merge = crate::merge_iterator::MergeIterator::new(children).unwrap();
+        let mut init = Box::pin(merge.init());
+        let first = futures::poll!(init.as_mut());
+        let returned_early = first.is_ready();
+        let dropped_early = cache.dropped.load(SeqCst);
+        cache.release();
+        let result = match first {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => {
+                tokio::time::timeout(std::time::Duration::from_secs(2), init.as_mut())
+                    .await
+                    .unwrap()
+            }
+        };
+        drop(init);
+        settle_scan_fixture_tasks(&originals).await;
+        drop(merge);
+        assert!(
+            matches!(result, Err(SlateDBError::IoError(ref error)) if error.to_string() == "scan child initialization failed"),
+            "initial child failure was not preserved: {result:?}"
+        );
+        assert!(
+            !returned_early,
+            "failed merge returned with original prefetch live"
+        );
+        assert_eq!(dropped_early, 0);
+        assert_eq!(cache.started.load(SeqCst), 1);
+        assert_eq!(cache.dropped.load(SeqCst), 1);
+        assert!(
+            !parent.is_cancelled(),
+            "closing a child canceled its caller"
+        );
+    }
 }
