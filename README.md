@@ -22,6 +22,18 @@ To mitigate read latency and read API costs (GETs), SlateDB will use standard LS
 
 Checkout [slatedb.io](https://slatedb.io) to learn more.
 
+## Othermemory point-read candidate
+
+Branch `codex/fh-point-read-window` adds cooperative cancellation to point reads while retaining the original call and its started work. This is a source candidate; it is not the installed shared binding or a complete native release.
+
+| Component | Reproducible source / evidence | Limit |
+| --- | --- | --- |
+| Point core and original multi-source joins | `17e7451c5c57abd3a23545be1894685ea78c0fc4`: 58 selected native controls pass; four window omissions fail at their named assertions | Complete native suites remain separate |
+| Existing UniFFI token and point adapters | `5b4966722f99709d1be85e13d990d8945281150e`: private Linux debug library SHA256 `5c23cdf5c08199a1d03682401b3e2df7b061c82fdfddcabc2c59be9aaa0fe6d1` | No Scan cancellation or shared installation |
+| Generated Go and callback/reader contract | `02ff5c6c41788fa2935f70b9570581d246a01e7d`: 28 named nodes pass ordinary and race; both selected-package vets pass | Complete Go modules and explicit binding omissions remain separate |
+
+Cancellable concurrent reads made four modeled GETs versus one on the legacy deduplicated path. Cache hits retain the original lookup; a local cache stall can still delay cancellation. No regional performance neutrality or fixed wall-clock interruption is claimed. The [dated run report](docs/runs/RUN_2026-09-30_native-point-cancellation.md) preserves original failures, exact commands, tool/library hashes, generated-byte provenance and process closure. Fork publication does not authorize a dependent merge; the shared binding roll is a separate, locked operation.
+
 ## Get Started
 
 Add the following to your `Cargo.toml`:
