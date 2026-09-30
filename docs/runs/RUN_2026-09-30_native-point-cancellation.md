@@ -120,3 +120,51 @@ The worker took 101.205655624 seconds. The full dispatcher took 184.770851750 se
 Evidence is under /private/tmp/om-fh-state/f/native-read-cancellation/native-point-behavior-k-v3/dispatch-20260930T124921Z-34413. The outer receipt is 3f7b0327022818acf0e82428c9d43184ff8440e7eb5ccde12877579550a505a9. The worker receipt is 326d319dcd49b2af7ed117aeaab568ea7c08b1e75d59352597f741dcf7b0cf57. The raw archive is f421144809314913f82ad0dfbacb36a13f80061bde4cf0d379a2ff3d51c33f59. The baseline log is 1f433e92fbd8195264ca8db39392f5e6a35d6f102ba555cd13f4100c1c8b25f7. The candidate log is 80204e20892f36e03ad929cfffa417de08207521b1d8cbe1a3def85b06fd49d5. All seven local and thirty worker command logs match their receipt hashes.
 
 These local failure timings are not object-store latency measurements. The napkin's 15–30ms GET rate still does not describe compilation or held fixtures. The regional 121765.887ms request debt remains open. No native publication, binding change, scan closure, shared roll, or public erasure follows from this attempt.
+
+
+## Behavior attempt 4: candidate and omission proof
+
+Candidate 96674bce719249457073c245af168de4acdad102 passed all fourteen parents. All nine original compatibility controls passed. Six separately compiled omissions each failed at the required assertion. No selected test was ignored. The packet retained the prior fourteen baseline failures and fourteen isolated failures. It read and hashed the original receipt and all fifteen baseline logs before work.
+
+The exact command was:
+
+```sh
+/usr/bin/python3 /private/tmp/om-fh-state/f/native-read-cancellation/native-point-behavior-k-v4/dispatch-owned.py --root-authorized-slot
+```
+
+The manifest was dcf4296cd1dcdc3ee128c76911aa237119fa048ff0266fef5d54e9bdb48eec05. No source, fixture, omission, assertion, retry policy, or deadline changed from v3. Both source archives and inventories stayed pinned. Rust 1.91.1 ran offline with two Cargo jobs and the foyer feature.
+
+Before each source transition, Cargo cleaned only the slatedb package in the original private target. The command was:
+
+```sh
+cargo clean --locked --offline -p slatedb --target x86_64-unknown-linux-gnu --target-dir /home/codex/inbox/f-native14-dispatch-20260930T054850Z-88285/target-41fb7b9-rust1.91.1-amd64
+```
+
+Each candidate and omission then reported fresh=false for the exact library source and integration test. Every output stayed inside that original target. The receipt records each artifact hash. The initial candidate test executable was 28b0baa43fb22ff1b90d0e039af2d18fc59af0b8e92f69251248ab55b08e6c78. Its rlib was abc7e712c838ed5a7e2ef81271d04926b27b968e26e3601be62c559f9ad1e86b. The first legacy group also compiled its exact unit-test source. The second group used the same recorded artifact. Dependency caches stayed retained.
+
+The main candidate command took 43.663568978 seconds. Cargo reported 42.15 seconds of compilation, followed by 1.34 seconds of tests. Its sampled group peak was 1,484,210,176 bytes. Seven original point-inline controls took 85.214686098 seconds, including compilation. They reported 0.04 seconds of tests. Their sampled peak was 3,380,342,784 bytes. The two original shared-loader controls took 0.630211513 seconds and reported 0.01 seconds of tests.
+
+The fourteen parents include all 24 held object-load cases across four public point surfaces. They also cover warm caches, concurrent read cost, observed storage errors, and original cache-lookup joins. The cache-lookup fixture holds the return from a real Foyer lookup in an original task. It models that ownership boundary, not a physical disk stall. Cancellation waits for this original lookup before return. A real local cache stall can still delay cancellation.
+
+The concurrent arms each started four original readers. Their measured results were:
+
+| Cache | Token | Object GETs | Held loaders | Elapsed microseconds | Next warm GETs |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Memory | Absent | 1 | 1 | 2532 | 0 |
+| Memory | Present | 4 | 4 | 3503 | 0 |
+| Hybrid | Absent | 1 | 1 | 1903 | 0 |
+| Hybrid | Present | 4 | 4 | 2668 | 0 |
+
+Thus cancellable misses made four times as many object GETs for four concurrent readers. The fixture elapsed ratios were 1.383 and 1.402. These local held-store controls do not measure real object-store latency. Their 1.903–3.503ms batches are below the napkin's 15–30ms rate for one real GET because the fixture uses local storage. They are also not warm single-read latency measurements. No performance-neutral claim follows from them. The regional 121765.887ms request, about 4.06 times its 30-second budget, still needs end-to-end proof.
+
+Each omission compiled and ran one parent. Removing object cancellation, caller-owned loaders, DbReader forwarding, or DbReaderSnapshot forwarding made cancellation wait for fixture release. Removing the cache join returned before the original cache lookup ended. Reversing error precedence masked the named storage error with cancellation. All six original commands exited 101 at these assertions. They had no compiler errors. The exact names, diagnostics, fresh artifact records, and raw logs remain in the receipt.
+
+The local original was 38917 with exec session 18595. Its seven children were 38919, 38935, 38946, 39370, 39389, 42362 and 42379. Worker owner146342 retained sixteen original Cargo groups. Their IDs were 146343, 146356, 146513, 146569, 146587, 146600, 146669, 146682, 146761, 146774, 146844, 146857, 146938, 146951, 147020 and 147033. Every original joined and every group was absent.
+
+The exact lock and owner inodes were [2049,3484497] and [2049,3484498]. Release completed at 13:07:07.518141Z. Independent terminal readback found the gate absent. The worker took 397.419603624 seconds. The full dispatcher took 471.523919834 seconds. Bounds remained 1200 seconds locally and 990 remotely, including 90 seconds for cleanup. No extension or retry ran.
+
+Both source inventories, packet inputs, Cargo.lock, Rust tools, canonical044, library16b51 and four dependencies stayed unchanged. OOM stayed 0. All twenty-three command logs matched their receipt hashes. K returned to the coordinator. A local evidence-reader initially used logs.stdout for the archive and failed before adjudication. It then used the recorded logs.bin path and completed every hash comparison. This did not rerun a remote command or change the original evidence.
+
+Evidence is under /private/tmp/om-fh-state/f/native-read-cancellation/native-point-behavior-k-v4/dispatch-20260930T125921Z-38917. The outer receipt is 6330905a0146518e39549eecdc59a9e866385d281808880b49211d1dfea33929. The worker receipt is 1c4999a752ddd275e729095fb720d7df16c5fa66526c0d322b7fe6d2d7342bfa. The raw archive is 00bfe10e14f9a66f591124fd25eaf1e6b1c2129d9a059aafd206c1ae9553fc8b. RESULTS.json records the separate candidate proof and retained baseline proof.
+
+This is the first passing native point behavior proof. Complete affected native tests, the Go token bridge, scan closure, library generation, fork publication, and the required shared roll remain separate. The old compiler failure, fixture timeout, and stale-artifact attempt remain recorded above. No public erasure or regional deadline acceptance follows from these results.
