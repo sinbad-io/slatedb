@@ -776,6 +776,148 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    struct CloseErrorSource {
+        entry: Option<RowEntry>,
+        read_error: Option<SlateDBError>,
+        closed: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RowEntryIterator for CloseErrorSource {
+        async fn init(&mut self) -> Result<(), SlateDBError> {
+            Ok(())
+        }
+        async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+            match self.read_error.take() {
+                Some(error) => Err(error),
+                None => Ok(self.entry.take()),
+            }
+        }
+        async fn seek(&mut self, _: &[u8]) -> Result<(), SlateDBError> {
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<(), SlateDBError> {
+            self.closed.fetch_add(1, Ordering::SeqCst);
+            Err(SlateDBError::IoError(Arc::new(std::io::Error::other(
+                "original close failure",
+            ))))
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn scan_exact_key_preserves_current_close_error(#[values(false, true)] tombstone: bool) {
+        let closed = Arc::new(AtomicUsize::new(0));
+        let entry = if tombstone {
+            RowEntry::new_tombstone(b"key", 1)
+        } else {
+            RowEntry::new_value(b"key", b"original", 1)
+        };
+        let source = CloseErrorSource {
+            entry: Some(entry),
+            read_error: None,
+            closed: closed.clone(),
+        };
+        let mut iter = DbIterator::new(
+            BytesRange::from(Bytes::from_static(b"key")..=Bytes::from_static(b"key")),
+            None,
+            Vec::<Box<dyn RowEntryIterator>>::new(),
+            Box::new(source),
+            None,
+            None,
+            IterationOrder::Ascending,
+            ReadTrace::new(None),
+        )
+        .await
+        .unwrap();
+        let result = iter.next_entry().await;
+        let close = iter.close_inner().await;
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(result, Err(SlateDBError::IoError(_))),
+            "{result:?}"
+        );
+        assert!(matches!(close, Err(SlateDBError::IoError(_))), "{close:?}");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn scan_exact_key_close_error_does_not_mask_selected_storage_error(
+        #[values(false, true)] cancelled: bool,
+    ) {
+        let closed = Arc::new(AtomicUsize::new(0));
+        let error = if cancelled {
+            SlateDBError::Cancelled
+        } else {
+            SlateDBError::ChecksumMismatch { path: None }
+        };
+        let source = CloseErrorSource {
+            entry: None,
+            read_error: Some(error),
+            closed: closed.clone(),
+        };
+        let mut iter = DbIterator::new(
+            BytesRange::from(Bytes::from_static(b"key")..=Bytes::from_static(b"key")),
+            None,
+            Vec::<Box<dyn RowEntryIterator>>::new(),
+            Box::new(source),
+            None,
+            None,
+            IterationOrder::Ascending,
+            ReadTrace::new(None),
+        )
+        .await
+        .unwrap();
+        let result = iter.next_entry().await;
+        let close = iter.close_inner().await;
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+        if cancelled {
+            assert!(
+                matches!(result, Err(SlateDBError::IoError(_))),
+                "{result:?}"
+            );
+            assert!(matches!(close, Err(SlateDBError::IoError(_))), "{close:?}");
+        } else {
+            assert!(
+                matches!(result, Err(SlateDBError::ChecksumMismatch { .. })),
+                "{result:?}"
+            );
+            assert!(
+                matches!(close, Err(SlateDBError::ChecksumMismatch { .. })),
+                "{close:?}"
+            );
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn point_unused_close_error_keeps_original_precedence(
+        #[values(false, true)] tombstone: bool,
+    ) {
+        let closed = Arc::new(AtomicUsize::new(0));
+        let entry = if tombstone {
+            RowEntry::new_tombstone(b"key", 1)
+        } else {
+            RowEntry::new_value(b"key", b"original", 1)
+        };
+        let source = CloseErrorSource {
+            entry: Some(entry),
+            read_error: None,
+            closed: closed.clone(),
+        };
+        let mut iter =
+            GetIterator::with_lookahead(Bytes::from_static(b"key"), vec![Box::new(source)], 1);
+        iter.join_on_stop = true;
+        let parent = tokio_util::sync::CancellationToken::new();
+        iter.cancellation_token = Some(parent.child_token());
+        let result = iter.next().await;
+        let close = iter.close().await;
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+        assert!(!parent.is_cancelled());
+        assert!(close.is_ok());
+        assert_eq!(result.unwrap().is_none(), tombstone);
+    }
+
     /// `ProbeRecord` records how the point lookup probes its sources.
     #[derive(Default)]
     struct ProbeRecord {

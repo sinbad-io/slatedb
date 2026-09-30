@@ -590,8 +590,504 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db_cache::DbCache;
     use crate::types::{RowEntry, ValueDeletable};
     use bytes::Bytes;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct RangeBuildProbe {
+        started: parking_lot::Mutex<Vec<usize>>,
+        held: AtomicBool,
+        failed: AtomicBool,
+        released: AtomicBool,
+        joined: AtomicUsize,
+        closed: AtomicUsize,
+        changed: tokio::sync::Notify,
+    }
+
+    impl RangeBuildProbe {
+        async fn wait(&self, flag: &AtomicBool) {
+            loop {
+                let changed = self.changed.notified();
+                if flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                changed.await;
+            }
+        }
+
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.changed.notify_waiters();
+        }
+    }
+
+    struct BuiltRangeProbe {
+        record: Arc<RangeBuildProbe>,
+        entry: Option<RowEntry>,
+    }
+
+    #[async_trait]
+    impl RowEntryIterator for BuiltRangeProbe {
+        async fn init(&mut self) -> Result<(), SlateDBError> {
+            Ok(())
+        }
+
+        async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+            Ok(self.entry.take())
+        }
+
+        async fn seek(&mut self, _: &[u8]) -> Result<(), SlateDBError> {
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), SlateDBError> {
+            self.record.closed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_token_free_factory_error_does_not_start_queued_factory() {
+        let record = Arc::new(RangeBuildProbe::default());
+        let result = build_range_iters(0..3, 1, None, |id| {
+            record.started.lock().push(id);
+            let record = record.clone();
+            async move {
+                if id == 0 {
+                    Err(SlateDBError::ChecksumMismatch { path: None })
+                } else {
+                    Ok(Some(Box::new(BuiltRangeProbe {
+                        record,
+                        entry: None,
+                    }) as Box<dyn RowEntryIterator>))
+                }
+            }
+        })
+        .await;
+        assert!(matches!(result, Err(SlateDBError::ChecksumMismatch { .. })));
+        assert_eq!(*record.started.lock(), vec![0]);
+        assert_eq!(record.closed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn scan_token_free_factory_error_joins_started_without_new_factory() {
+        let record = Arc::new(RangeBuildProbe::default());
+        let original_record = record.clone();
+        let mut original = tokio::spawn(async move {
+            build_range_iters(0..3, 2, None, |id| {
+                original_record.started.lock().push(id);
+                let record = original_record.clone();
+                async move {
+                    if id == 0 {
+                        record.wait(&record.held).await;
+                        record.failed.store(true, Ordering::SeqCst);
+                        record.changed.notify_waiters();
+                        return Err(SlateDBError::ChecksumMismatch { path: None });
+                    }
+                    if id == 1 {
+                        record.held.store(true, Ordering::SeqCst);
+                        record.changed.notify_waiters();
+                        record.wait(&record.released).await;
+                        record.joined.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(Some(Box::new(BuiltRangeProbe {
+                        record,
+                        entry: None,
+                    }) as Box<dyn RowEntryIterator>))
+                }
+            })
+            .await
+        });
+        let started =
+            tokio::time::timeout(Duration::from_secs(2), record.wait(&record.failed)).await;
+        let early = tokio::time::timeout(Duration::from_millis(25), &mut original).await;
+        record.release();
+        let (returned_early, result) = match early {
+            Ok(result) => (true, result),
+            Err(_) => match tokio::time::timeout(Duration::from_secs(2), &mut original).await {
+                Ok(result) => (false, result),
+                Err(_) => {
+                    original.abort();
+                    let _ = original.await;
+                    panic!("original factory did not join after releasing its held work");
+                }
+            },
+        };
+        assert!(
+            started.is_ok(),
+            "original held factory and failure were not observed"
+        );
+        assert!(
+            !returned_early,
+            "construction returned while its original factory was held"
+        );
+        assert!(matches!(
+            result.unwrap(),
+            Err(SlateDBError::ChecksumMismatch { .. })
+        ));
+        assert_eq!(*record.started.lock(), vec![0, 1]);
+        assert_eq!(record.joined.load(Ordering::SeqCst), 1);
+        assert_eq!(record.closed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn scan_token_free_factory_success_keeps_unordered_completion() {
+        let record = Arc::new(RangeBuildProbe::default());
+        let mut build = Box::pin(build_range_iters(0..2, 2, None, |id| {
+            record.started.lock().push(id);
+            let record = record.clone();
+            async move {
+                if id == 0 {
+                    record.wait(&record.released).await;
+                }
+                Ok(Some(Box::new(BuiltRangeProbe {
+                    record,
+                    entry: Some(RowEntry::new_value(b"key", &[id as u8], 1)),
+                }) as Box<dyn RowEntryIterator>))
+            }
+        }));
+        assert!(futures::poll!(build.as_mut()).is_pending());
+        let started = record.started.lock().clone();
+        record.release();
+        let mut iters = tokio::time::timeout(Duration::from_secs(2), build)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut order = Vec::new();
+        for iter in &mut iters {
+            order.push(
+                iter.next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .value
+                    .as_bytes()
+                    .unwrap()[0],
+            );
+            iter.close().await.unwrap();
+        }
+        assert_eq!(
+            started,
+            vec![0, 1],
+            "successful construction must remain concurrent"
+        );
+        assert_eq!(order, vec![1, 0], "successful completion order changed");
+        assert_eq!(record.closed.load(Ordering::SeqCst), 2);
+    }
+
+    // This is an actual TableStore/cache construction boundary, not a provider
+    // failure or a physical disk stall. One original index callback is held
+    // while the other arm reaches a deliberately missing in-memory SST.
+    struct RangeBuildCache {
+        inner: crate::db_cache::test_utils::TestCache,
+        record: Arc<RangeBuildProbe>,
+        failure: crate::db_state::SsTableId,
+        held: crate::db_state::SsTableId,
+        unopened: Vec<crate::db_state::SsTableId>,
+        unwanted: AtomicUsize,
+        point_cleanup: bool,
+    }
+
+    #[async_trait]
+    impl crate::db_cache::DbCache for RangeBuildCache {
+        async fn get_block(
+            &self,
+            key: &crate::db_cache::CachedKey,
+        ) -> Result<Option<crate::db_cache::CachedEntry>, crate::Error> {
+            self.inner.get_block(key).await
+        }
+        async fn get_index(
+            &self,
+            key: &crate::db_cache::CachedKey,
+        ) -> Result<Option<crate::db_cache::CachedEntry>, crate::Error> {
+            if self.unopened.contains(&key.sst_id) {
+                self.unwanted.fetch_add(1, Ordering::SeqCst);
+            }
+            if self.point_cleanup {
+                if key.sst_id == self.held {
+                    self.record.wait(&self.record.held).await;
+                }
+                if key.sst_id == self.failure {
+                    self.record.held.store(true, Ordering::SeqCst);
+                    self.record.changed.notify_waiters();
+                    self.record.wait(&self.record.released).await;
+                    self.record.joined.fetch_add(1, Ordering::SeqCst);
+                    return Err(crate::Error::unavailable("use missing original SST".into()));
+                }
+                return self.inner.get_index(key).await;
+            }
+            if key.sst_id == self.failure {
+                self.record.wait(&self.record.held).await;
+                self.record.failed.store(true, Ordering::SeqCst);
+                self.record.changed.notify_waiters();
+                return Err(crate::Error::unavailable(
+                    "original range index error".into(),
+                ));
+            }
+            if key.sst_id == self.held {
+                self.record.held.store(true, Ordering::SeqCst);
+                self.record.changed.notify_waiters();
+                self.record.wait(&self.record.released).await;
+                self.record.joined.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get_index(key).await
+        }
+        async fn get_filter(
+            &self,
+            key: &crate::db_cache::CachedKey,
+        ) -> Result<Option<crate::db_cache::CachedEntry>, crate::Error> {
+            self.inner.get_filter(key).await
+        }
+        async fn get_stats(
+            &self,
+            key: &crate::db_cache::CachedKey,
+        ) -> Result<Option<crate::db_cache::CachedEntry>, crate::Error> {
+            self.inner.get_stats(key).await
+        }
+        async fn insert(
+            &self,
+            key: crate::db_cache::CachedKey,
+            value: crate::db_cache::CachedEntry,
+        ) {
+            self.inner.insert(key, value).await;
+        }
+        async fn remove(&self, key: &crate::db_cache::CachedKey) {
+            self.inner.remove(key).await;
+        }
+        fn entry_count(&self) -> u64 {
+            self.inner.entry_count()
+        }
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn scan_token_free_range_failure_retires_both_original_arms(
+        #[values(false, true)] failure_in_l0: bool,
+    ) {
+        use crate::block_cache_policy::BlockCachePolicy;
+        use crate::db_state::SsTableId;
+        use crate::format::sst::SsTableFormat;
+        use crate::tablestore::TableStoreKind;
+        use slatedb_common::metrics::{DefaultMetricsRecorder, MetricLevel, MetricsRecorderHelper};
+        let ids: Vec<_> = (1..=4)
+            .map(|id| SsTableId::from(ulid::Ulid::from_parts(id, 0)))
+            .collect();
+        let record = Arc::new(RangeBuildProbe::default());
+        let cache = Arc::new(RangeBuildCache {
+            inner: crate::db_cache::test_utils::TestCache::new(),
+            record: record.clone(),
+            failure: ids[if failure_in_l0 { 0 } else { 2 }].clone(),
+            held: ids[if failure_in_l0 { 2 } else { 0 }].clone(),
+            unopened: vec![ids[1].clone(), ids[3].clone()],
+            unwanted: AtomicUsize::new(0),
+            point_cleanup: false,
+        });
+        let table_store = Arc::new(TableStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            SsTableFormat::default(),
+            object_store::path::Path::from("scan-construction-arms"),
+            Some(cache.clone()),
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        ));
+        let mut tables = Vec::new();
+        for id in ids {
+            let mut writer = table_store.table_writer(id, Some(Bytes::new()));
+            writer
+                .add(RowEntry::new_value(b"key", b"original", 1))
+                .await
+                .unwrap();
+            tables.push(SsTableView::identity(writer.close().await.unwrap().0));
+        }
+        // The production cache-error fallback remains unchanged. Its next
+        // real object read sees this missing fixture SST, without transport retries.
+        table_store.delete_sst(&cache.failure).await.unwrap();
+        let tree = LsmTreeState {
+            l0: tables[..2].iter().cloned().collect(),
+            compacted: vec![
+                SortedRun::new(1, [tables[2].clone()]),
+                SortedRun::new(2, [tables[3].clone()]),
+            ],
+            ..LsmTreeState::default()
+        };
+        let helper = MetricsRecorderHelper::new(
+            Arc::new(DefaultMetricsRecorder::new()),
+            MetricLevel::default(),
+        );
+        let context = SegmentScanContext {
+            table_store,
+            range: BytesRange::from(..),
+            max_parallel: 1,
+            sst_iter_options: SstIteratorOptions {
+                segment: Some(Bytes::new()),
+                ..SstIteratorOptions::default()
+            },
+            point_lookup_stats: None,
+            db_stats: DbStats::new(&helper),
+            read_trace: ReadTrace::new(None),
+        };
+        let mut original =
+            tokio::spawn(async move { RangeTreeIterators::build(&tree, &context).await });
+        let started =
+            tokio::time::timeout(Duration::from_secs(2), record.wait(&record.failed)).await;
+        let early = tokio::time::timeout(Duration::from_millis(25), &mut original).await;
+        cache.record.release();
+        let (returned_early, result) = match early {
+            Ok(result) => (true, result),
+            Err(_) => match tokio::time::timeout(Duration::from_secs(2), &mut original).await {
+                Ok(result) => (false, result),
+                Err(_) => {
+                    original.abort();
+                    let _ = original.await;
+                    panic!("original range construction did not join");
+                }
+            },
+        };
+        let error = match result.unwrap() {
+            Err(error) => error,
+            Ok(mut iters) => {
+                for iter in iters.l0.iter_mut().chain(&mut iters.sr) {
+                    iter.close().await.unwrap();
+                }
+                panic!("range construction lost original cache error");
+            }
+        };
+        assert!(
+            started.is_ok(),
+            "did not witness both original construction arms"
+        );
+        assert!(!returned_early, "failed arm dropped the held original arm");
+        assert!(
+            matches!(error, SlateDBError::ObjectStoreError(ref error)
+            if matches!(error.as_ref(), object_store::Error::NotFound { .. })),
+            "{error:?}"
+        );
+        assert_eq!(record.joined.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cache.unwanted.load(Ordering::SeqCst),
+            0,
+            "failure admitted a queued table on one construction arm"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_exact_key_returns_joined_unused_storage_error() {
+        use crate::block_cache_policy::BlockCachePolicy;
+        use crate::db_state::SsTableId;
+        use crate::format::sst::SsTableFormat;
+        use crate::tablestore::TableStoreKind;
+        use slatedb_common::metrics::{DefaultMetricsRecorder, MetricLevel, MetricsRecorderHelper};
+        let ids: Vec<_> = (1..=3)
+            .map(|id| SsTableId::from(ulid::Ulid::from_parts(id, 0)))
+            .collect();
+        let record = Arc::new(RangeBuildProbe::default());
+        let cache = Arc::new(RangeBuildCache {
+            inner: crate::db_cache::test_utils::TestCache::new(),
+            record: record.clone(),
+            failure: ids[2].clone(),
+            held: ids[1].clone(),
+            unopened: Vec::new(),
+            unwanted: AtomicUsize::new(0),
+            point_cleanup: true,
+        });
+        let table_store = Arc::new(TableStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            SsTableFormat::default(),
+            object_store::path::Path::from("scan-exact-key-cleanup"),
+            Some(cache.clone()),
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        ));
+        let mut tables = VecDeque::new();
+        for (id, seq) in ids.into_iter().zip([10, 4, 1]) {
+            let mut writer = table_store.table_writer(id, Some(Bytes::new()));
+            writer
+                .add(RowEntry::new_value(b"key", b"original", seq))
+                .await
+                .unwrap();
+            tables.push_back(SsTableView::identity(writer.close().await.unwrap().0));
+        }
+        table_store.delete_sst(&cache.failure).await.unwrap();
+        let tree = LsmTreeState {
+            l0: tables,
+            ..LsmTreeState::default()
+        };
+        let helper = MetricsRecorderHelper::new(
+            Arc::new(DefaultMetricsRecorder::new()),
+            MetricLevel::default(),
+        );
+        let range = BytesRange::from(Bytes::from_static(b"key")..=Bytes::from_static(b"key"));
+        let context = SegmentScanContext {
+            table_store,
+            range: range.clone(),
+            max_parallel: 2,
+            sst_iter_options: SstIteratorOptions {
+                segment: Some(Bytes::new()),
+                inline_point_read: false,
+                ..SstIteratorOptions::default()
+            },
+            point_lookup_stats: None,
+            db_stats: DbStats::new(&helper),
+            read_trace: ReadTrace::new(None),
+        };
+        let inner =
+            GetIterator::from_lsm_tree(Bytes::from_static(b"key"), &tree, &context, Some(5))
+                .unwrap();
+        let mut iter = crate::db_iter::DbIterator::new(
+            range,
+            None,
+            Vec::<Box<dyn RowEntryIterator>>::new(),
+            Box::new(inner),
+            Some(5),
+            None,
+            IterationOrder::Ascending,
+            ReadTrace::new(None),
+        )
+        .await
+        .unwrap();
+        let mut original = tokio::spawn(async move {
+            let result = iter.next_entry().await;
+            let closed = iter.close_inner().await;
+            (result, closed)
+        });
+        let started = tokio::time::timeout(Duration::from_secs(2), record.wait(&record.held)).await;
+        let early = tokio::time::timeout(Duration::from_millis(25), &mut original).await;
+        record.release();
+        let (returned_early, result) = match early {
+            Ok(result) => (true, result),
+            Err(_) => match tokio::time::timeout(Duration::from_secs(2), &mut original).await {
+                Ok(result) => (false, result),
+                Err(_) => {
+                    original.abort();
+                    let _ = original.await;
+                    panic!("original exact-key Scan did not join");
+                }
+            },
+        };
+        let (result, closed) = result.unwrap();
+        assert!(
+            started.is_ok(),
+            "original unused index lookup never started"
+        );
+        assert!(
+            !returned_early,
+            "exact-key Scan returned before original unused lookup joined"
+        );
+        assert_eq!(record.joined.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(result, Err(SlateDBError::ObjectStoreError(ref error))
+            if matches!(error.as_ref(), object_store::Error::NotFound { .. })),
+            "{result:?}"
+        );
+        assert!(
+            matches!(closed, Err(SlateDBError::ObjectStoreError(ref error))
+            if matches!(error.as_ref(), object_store::Error::NotFound { .. })),
+            "{closed:?}"
+        );
+    }
 
     /// Vec-backed iterator over fixed RowEntries. `seek` discards
     /// entries on the already-emitted side of `next_key` according to
