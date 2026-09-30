@@ -157,6 +157,7 @@ mod tests {
     // published point binding. These are separate from old-API Go behavior.
     #[tokio::test]
     async fn scan_close_cancels_original_before_waiting_for_iterator_mutex() {
+        use std::future::Future;
         let db = seeded_db().await;
         let parent = crate::cancellation::CancellationToken::new();
         let options: slatedb::config::ScanOptions = crate::config::ScanOptions {
@@ -172,7 +173,9 @@ mod tests {
         let iter = DbIterator::new(inner);
         let held = iter.inner.lock().await;
         let mut close = Box::pin(iter.close());
-        let pending = futures::poll!(close.as_mut()).is_pending();
+        let pending =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(close.as_mut().poll(cx).is_pending()))
+                .await;
         let signaled = original.is_cancelled();
         let parent_cancelled = parent.is_cancelled();
         drop(held);
