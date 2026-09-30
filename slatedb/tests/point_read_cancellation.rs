@@ -512,3 +512,449 @@ async fn cancellable_memory_hit_preserves_cache_and_view() {
 async fn cancellable_hybrid_disk_hit_preserves_cache_and_view() {
     cancellable_warm_cache_stays_warm(true).await;
 }
+
+async fn open_original(
+    store: Arc<dyn ObjectStore>,
+    cache: Arc<dyn DbCache>,
+    reader: bool,
+) -> OriginalOwner {
+    if reader {
+        OriginalOwner::Reader(Arc::new(
+            DbReader::builder("point-cancellation", store)
+                .with_reader_mode(DbReaderMode::FollowLatest)
+                .with_options(DbReaderOptions {
+                    manifest_poll_interval: Duration::from_secs(3600),
+                    skip_wal_replay: true,
+                    ..DbReaderOptions::default()
+                })
+                .with_db_cache(cache, 1)
+                .build()
+                .await
+                .unwrap(),
+        ))
+    } else {
+        OriginalOwner::Writer(Arc::new(
+            Db::builder("point-cancellation", store)
+                .with_settings(settings())
+                .with_db_cache(cache, 1)
+                .build()
+                .await
+                .unwrap(),
+        ))
+    }
+}
+
+async fn seeded_store() -> Arc<dyn ObjectStore> {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let seed = Db::builder("point-cancellation", store.clone())
+        .with_settings(settings())
+        .with_db_cache_disabled()
+        .build()
+        .await
+        .unwrap();
+    seed.put(KEY, VALUE).await.unwrap();
+    seed.flush_with_options(FlushOptions {
+        flush_type: FlushType::MemTable,
+    })
+    .await
+    .unwrap();
+    seed.close().await.unwrap();
+    store
+}
+
+async fn concurrent_read_cost(hybrid: bool) {
+    for cancellable in [false, true] {
+        let (db, store, cache, _directory) = fixture(hybrid, Part::Data, false).await;
+        let before = store.ranged_gets.load(SeqCst);
+        let start = std::time::Instant::now();
+        let mut reads = Vec::new();
+        let polled = ReadHold::new();
+        for _ in 0..4 {
+            let db = db.clone();
+            let polled = polled.clone();
+            reads.push(tokio::spawn(async move {
+                let options = ReadOptions {
+                    cancellation_token: cancellable.then(CancellationToken::new),
+                    ..ReadOptions::default()
+                };
+                let mut read = Box::pin(db.get_with_options(KEY, &options));
+                let mut first = true;
+                futures::future::poll_fn(|cx| {
+                    let result = std::future::Future::poll(read.as_mut(), cx);
+                    if first {
+                        first = false;
+                        polled.started.fetch_add(1, SeqCst);
+                        polled.changed.notify_waiters();
+                    }
+                    result
+                })
+                .await
+            }));
+        }
+        let all_polled = timeout(Duration::from_secs(2), polled.wait_started(4)).await;
+        let expected = if cancellable { 4 } else { 1 };
+        let started = timeout(Duration::from_secs(2), store.hold.wait_started(expected)).await;
+        let active = store.hold.active.load(SeqCst);
+        store.hold.release();
+        let mut results = Vec::new();
+        for read in reads {
+            results.push(
+                timeout(Duration::from_secs(2), read)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        timeout(Duration::from_secs(2), store.hold.wait_empty())
+            .await
+            .unwrap();
+        let gets = store.ranged_gets.load(SeqCst) - before;
+        let elapsed = start.elapsed();
+        let warm_before = store.ranged_gets.load(SeqCst);
+        let warm = db
+            .get_with_options(
+                KEY,
+                &ReadOptions {
+                    cancellation_token: Some(CancellationToken::new()),
+                    ..ReadOptions::default()
+                },
+            )
+            .await;
+        let warm_gets = store.ranged_gets.load(SeqCst) - warm_before;
+        db.close().await.unwrap();
+        cache.close().await.unwrap();
+        println!("concurrent-cost hybrid={hybrid} cancellable={cancellable} readers=4 object_gets={gets} held_loaders={active} elapsed_us={} warm_gets={warm_gets}", elapsed.as_micros());
+        assert!(
+            all_polled.is_ok(),
+            "not all four original reads were polled"
+        );
+        assert!(
+            started.is_ok(),
+            "the selected original loaders did not start"
+        );
+        assert_eq!(active, expected, "concurrent loader ownership changed");
+        assert_eq!(
+            gets, expected,
+            "object GET cost differs from the selected path"
+        );
+        assert_eq!(
+            warm_gets, 0,
+            "the next token read did not reuse its cache entry"
+        );
+        assert_eq!(warm.unwrap(), Some(Bytes::from_static(VALUE)));
+        for result in results {
+            assert_eq!(result.unwrap(), Some(Bytes::from_static(VALUE)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancellable_memory_reads_expose_owned_get_cost() {
+    concurrent_read_cost(false).await;
+}
+
+#[tokio::test]
+async fn cancellable_hybrid_reads_expose_owned_get_cost() {
+    concurrent_read_cost(true).await;
+}
+
+#[derive(Debug)]
+struct CancelErrorStore {
+    inner: Arc<dyn ObjectStore>,
+    token: CancellationToken,
+    armed: AtomicBool,
+    errors: AtomicUsize,
+}
+
+impl std::fmt::Display for CancelErrorStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CancelErrorStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for CancelErrorStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, options).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        if location.as_ref().contains("/compacted/")
+            && options.range.is_some()
+            && self.armed.load(SeqCst)
+        {
+            self.errors.fetch_add(1, SeqCst);
+            self.token.cancel();
+            return Err(object_store::Error::Generic {
+                store: "point-cancellation-fixture",
+                source: Box::new(std::io::Error::other("original point storage failure")),
+            });
+        }
+        self.inner.get_opts(location, options).await
+    }
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+async fn observed_storage_error_survives_cancel(hybrid: bool) {
+    for (reader, snapshot) in [(false, false), (false, true), (true, false), (true, true)] {
+        let directory = TempDir::new().unwrap();
+        let token = CancellationToken::new();
+        let store = Arc::new(CancelErrorStore {
+            inner: seeded_store().await,
+            token: token.clone(),
+            armed: AtomicBool::new(false),
+            errors: AtomicUsize::new(0),
+        });
+        let cache = cache(hybrid, directory.path()).await;
+        let db = open_original(store.clone(), cache.clone(), reader).await;
+        let original_snapshot = db.snapshot().await.unwrap();
+        store.armed.store(true, SeqCst);
+        let options = ReadOptions {
+            cancellation_token: Some(token),
+            ..ReadOptions::default()
+        };
+        let result = if snapshot {
+            original_snapshot.get_with_options(KEY, &options).await
+        } else {
+            db.get_with_options(KEY, &options).await
+        };
+        let observed = store.errors.load(SeqCst);
+        store.armed.store(false, SeqCst);
+        let next = original_snapshot.get(KEY).await;
+        drop(original_snapshot);
+        db.close().await.unwrap();
+        cache.close().await.unwrap();
+        assert_eq!(
+            observed, 1,
+            "the original token read did not observe exactly one storage error"
+        );
+        let error = result.expect_err("the storage failure returned a value");
+        assert!(
+            matches!(error.kind(), ErrorKind::Unavailable),
+            "storage error was masked by cancellation: {error:?}"
+        );
+        assert!(
+            format!("{error:?}").contains("original point storage failure"),
+            "original storage cause was lost: {error:?}"
+        );
+        assert_eq!(next.unwrap(), Some(Bytes::from_static(VALUE)));
+    }
+}
+
+#[tokio::test]
+async fn memory_point_read_preserves_observed_storage_error() {
+    observed_storage_error_survives_cancel(false).await;
+}
+
+#[tokio::test]
+async fn hybrid_point_read_preserves_observed_storage_error() {
+    observed_storage_error_survives_cancel(true).await;
+}
+
+struct JoinedCache {
+    inner: Arc<dyn DbCache>,
+    hold: Arc<ReadHold>,
+    armed: AtomicBool,
+    original: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+#[async_trait]
+impl DbCache for JoinedCache {
+    async fn get_block(
+        &self,
+        key: &slatedb::db_cache::CachedKey,
+    ) -> Result<Option<CachedEntry>, slatedb::Error> {
+        if !self.armed.swap(false, SeqCst) {
+            return self.inner.get_block(key).await;
+        }
+        let inner = self.inner.clone();
+        let key = key.clone();
+        let hold = self.hold.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        // This fixture holds the return from a real cache lookup in one original task.
+        // It models Foyer's detached lookup boundary, not a physical disk stall.
+        let original = tokio::spawn(async move {
+            let result = inner.get_block(&key).await;
+            hold.active.fetch_add(1, SeqCst);
+            let retained = ActiveRead(hold.clone());
+            hold.started.fetch_add(1, SeqCst);
+            hold.changed.notify_waiters();
+            loop {
+                let changed = hold.changed.notified();
+                if hold.released.load(SeqCst) {
+                    break;
+                }
+                changed.await;
+            }
+            drop(retained);
+            let _ = send.send(result);
+        });
+        let previous = self.original.lock().unwrap().replace(original);
+        assert!(
+            previous.is_none(),
+            "the fixture replaced an original lookup"
+        );
+        receive
+            .await
+            .expect("original cache lookup sender disappeared")
+    }
+    async fn get_index(
+        &self,
+        key: &slatedb::db_cache::CachedKey,
+    ) -> Result<Option<CachedEntry>, slatedb::Error> {
+        self.inner.get_index(key).await
+    }
+    async fn get_filter(
+        &self,
+        key: &slatedb::db_cache::CachedKey,
+    ) -> Result<Option<CachedEntry>, slatedb::Error> {
+        self.inner.get_filter(key).await
+    }
+    async fn get_stats(
+        &self,
+        key: &slatedb::db_cache::CachedKey,
+    ) -> Result<Option<CachedEntry>, slatedb::Error> {
+        self.inner.get_stats(key).await
+    }
+    async fn insert(&self, key: slatedb::db_cache::CachedKey, value: CachedEntry) {
+        self.inner.insert(key, value).await
+    }
+    async fn remove(&self, key: &slatedb::db_cache::CachedKey) {
+        self.inner.remove(key).await
+    }
+    fn entry_count(&self) -> u64 {
+        self.inner.entry_count()
+    }
+    async fn flush_scope(&self, scope: u64) -> Result<(), slatedb::Error> {
+        self.inner.flush_scope(scope).await
+    }
+}
+
+async fn cancelled_cache_lookup_is_joined(hybrid: bool) {
+    for (reader, snapshot) in [(false, false), (false, true), (true, false), (true, true)] {
+        let directory = TempDir::new().unwrap();
+        let inner = cache(hybrid, directory.path()).await;
+        let cache = Arc::new(JoinedCache {
+            inner: inner.clone(),
+            hold: ReadHold::new(),
+            armed: AtomicBool::new(false),
+            original: std::sync::Mutex::new(None),
+        });
+        let db = open_original(seeded_store().await, cache.clone(), reader).await;
+        let warm = db.get(KEY).await;
+        if hybrid {
+            cache.flush_scope(1).await.unwrap();
+        }
+        let token = CancellationToken::new();
+        let options = ReadOptions {
+            cancellation_token: Some(token.clone()),
+            ..ReadOptions::default()
+        };
+        let original_snapshot = db.snapshot().await.unwrap();
+        cache.armed.store(true, SeqCst);
+        let mut original = tokio::spawn({
+            let db = db.clone();
+            let original_snapshot = original_snapshot.clone();
+            async move {
+                if snapshot {
+                    original_snapshot.get_with_options(KEY, &options).await
+                } else {
+                    db.get_with_options(KEY, &options).await
+                }
+            }
+        });
+        let started = timeout(Duration::from_secs(2), cache.hold.wait_started(1)).await;
+        token.cancel();
+        let early = timeout(Duration::from_millis(50), &mut original).await;
+        let active_before_release = cache.hold.active.load(SeqCst);
+        cache.hold.release();
+        let (returned_early, result) = match early {
+            Ok(result) => (true, result.unwrap()),
+            Err(_) => (
+                false,
+                timeout(Duration::from_secs(2), original)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            ),
+        };
+        let original_lookup = cache.original.lock().unwrap().take();
+        if let Some(original_lookup) = original_lookup {
+            timeout(Duration::from_secs(2), original_lookup)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let active_after_return = cache.hold.active.load(SeqCst);
+        let next = original_snapshot.get(KEY).await;
+        drop(original_snapshot);
+        db.close().await.unwrap();
+        inner.close().await.unwrap();
+        assert!(
+            started.is_ok(),
+            "original cache lookup never reached the held return"
+        );
+        assert!(
+            !returned_early,
+            "cancelled read returned before its original cache lookup joined"
+        );
+        assert_eq!(
+            active_before_release, 1,
+            "cache lookup did not remain active until release"
+        );
+        assert_eq!(
+            active_after_return, 0,
+            "cache lookup survived the original read"
+        );
+        assert!(
+            matches!(result, Err(ref e) if matches!(e.kind(), ErrorKind::Cancelled)),
+            "joined cancellation returned a value or wrong error: {result:?}"
+        );
+        assert_eq!(warm.unwrap(), Some(Bytes::from_static(VALUE)));
+        assert_eq!(next.unwrap(), Some(Bytes::from_static(VALUE)));
+    }
+}
+
+#[tokio::test]
+async fn cancelled_memory_cache_lookup_keeps_original_join() {
+    cancelled_cache_lookup_is_joined(false).await;
+}
+
+#[tokio::test]
+async fn cancelled_hybrid_cache_lookup_keeps_original_join() {
+    cancelled_cache_lookup_is_joined(true).await;
+}

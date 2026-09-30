@@ -167,6 +167,7 @@ impl Default for ReadOptions {
 impl From<ReadOptions> for slatedb::config::ReadOptions {
     fn from(value: ReadOptions) -> Self {
         slatedb::config::ReadOptions {
+            cancellation_token: None,
             durability_filter: value.durability_filter.into(),
             dirty: value.dirty,
             cache_blocks: value.cache_blocks,

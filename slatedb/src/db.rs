@@ -3201,6 +3201,7 @@ mod tests {
                                 db.get_with_options(
                                     &key,
                                     &ReadOptions {
+                                        cancellation_token: None,
                                         durability_filter: Memory,
                                         dirty: false,
                                         cache_blocks: true,
