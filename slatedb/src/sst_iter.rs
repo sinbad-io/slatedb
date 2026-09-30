@@ -30,7 +30,10 @@ use crate::{
 enum FetchTask {
     InFlight(JoinHandle<Result<VecDeque<Arc<Block>>, SlateDBError>>),
     // Exclusive iterator access polls through get_mut; no lock is held over await.
-    Inline(parking_lot::Mutex<BoxFuture<'static, Result<VecDeque<Arc<Block>>, SlateDBError>>>),
+    Inline {
+        read: parking_lot::Mutex<BoxFuture<'static, Result<VecDeque<Arc<Block>>, SlateDBError>>>,
+        started: bool,
+    },
     Finished(VecDeque<Arc<Block>>),
 }
 
@@ -518,7 +521,10 @@ impl<'a> InternalSstIterator<'a> {
                         && self.options.max_fetch_tasks == 1
                         && single_block
                     {
-                        FetchTask::Inline(parking_lot::Mutex::new(Box::pin(read)))
+                        FetchTask::Inline {
+                            read: parking_lot::Mutex::new(Box::pin(read)),
+                            started: false,
+                        }
                     } else {
                         FetchTask::InFlight(tokio::spawn(read))
                     };
@@ -589,9 +595,10 @@ impl<'a> InternalSstIterator<'a> {
             }
             if let Some(fetch_task) = self.fetch_tasks.front_mut() {
                 match fetch_task {
-                    FetchTask::Inline(read) => {
+                    FetchTask::Inline { read, started } => {
                         // Keep the future in the queue if the caller cancels this
                         // next/init await: the block cursor has already advanced.
+                        *started = true;
                         let result = AssertUnwindSafe(read.get_mut())
                             .catch_unwind()
                             .await
@@ -707,7 +714,11 @@ impl<'a> InternalSstIterator<'a> {
                     .await
                     .map_err(|error| block_fetch_join_error(error, self.view.table_as_ref().sst.id))
                     .and_then(|value| value.map(|_| ())),
-                FetchTask::Inline(read) => AssertUnwindSafe(read.get_mut())
+                FetchTask::Inline { started: false, .. } => Ok(()),
+                FetchTask::Inline {
+                    read,
+                    started: true,
+                } => AssertUnwindSafe(read.get_mut())
                     .catch_unwind()
                     .await
                     .map_err(|error| {
