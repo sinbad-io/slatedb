@@ -392,6 +392,8 @@ impl From<SlateDBError> for WalError {
     fn from(value: SlateDBError) -> Self {
         let public: crate::Error = value.clone().into();
         match public.kind() {
+            // Cancellation applies to point reads, not WAL operations.
+            ErrorKind::Cancelled => WalError::InternalError(Arc::new(value)),
             ErrorKind::Closed(CloseReason::Fenced) => WalError::Fenced,
             ErrorKind::Closed(CloseReason::Clean) => WalError::Closed,
             ErrorKind::Closed(_) => WalError::InternalError(Arc::new(value)),
