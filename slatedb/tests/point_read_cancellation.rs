@@ -517,6 +517,7 @@ async fn open_original(
     store: Arc<dyn ObjectStore>,
     cache: Arc<dyn DbCache>,
     reader: bool,
+    max_retries: Option<u32>,
 ) -> OriginalOwner {
     if reader {
         OriginalOwner::Reader(Arc::new(
@@ -525,6 +526,7 @@ async fn open_original(
                 .with_options(DbReaderOptions {
                     manifest_poll_interval: Duration::from_secs(3600),
                     skip_wal_replay: true,
+                    object_store_max_retries: max_retries,
                     ..DbReaderOptions::default()
                 })
                 .with_db_cache(cache, 1)
@@ -535,7 +537,10 @@ async fn open_original(
     } else {
         OriginalOwner::Writer(Arc::new(
             Db::builder("point-cancellation", store)
-                .with_settings(settings())
+                .with_settings(Settings {
+                    object_store_max_retries: max_retries,
+                    ..settings()
+                })
                 .with_db_cache(cache, 1)
                 .build()
                 .await
@@ -740,7 +745,7 @@ async fn observed_storage_error_survives_cancel(hybrid: bool) {
             errors: AtomicUsize::new(0),
         });
         let cache = cache(hybrid, directory.path()).await;
-        let db = open_original(store.clone(), cache.clone(), reader).await;
+        let db = open_original(store.clone(), cache.clone(), reader, Some(0)).await;
         let original_snapshot = db.snapshot().await.unwrap();
         store.armed.store(true, SeqCst);
         let options = ReadOptions {
@@ -874,7 +879,7 @@ async fn cancelled_cache_lookup_is_joined(hybrid: bool) {
             armed: AtomicBool::new(false),
             original: std::sync::Mutex::new(None),
         });
-        let db = open_original(seeded_store().await, cache.clone(), reader).await;
+        let db = open_original(seeded_store().await, cache.clone(), reader, None).await;
         let warm = db.get(KEY).await;
         if hybrid {
             cache.flush_scope(1).await.unwrap();
