@@ -306,3 +306,45 @@ The next point prerequisites are a private library/generated binding with
 actual Go callback/reader error controls, full affected verification, fork
 publication and the separately locked shared roll. None ran in this packet.
 Scan lifetime and protected erasure/material receipt completion stay separate.
+
+## Private point binding and Go bridge, 18:16Z
+
+The original-window native core remains tested at `17e7451c5c57abd3a23545be1894685ea78c0fc4`, documented at `38ac27dcdb9523d1c90b5310a80170dba6a8886f`: 58 named passes and four independently compiling intended omission failures. Cancellable concurrent reads made four modeled GETs versus one for the legacy path; this cost remains, and neither local timing nor modeled hybrid-cache holds prove physical disk or regional object-store latency. Against `docs/napkin.md`, these are correctness and compile observations, not a new regional performance gate.
+
+The private binding source `5b4966722f99709d1be85e13d990d8945281150e` applies only the previously reviewed token field/conversion, original ReaderSnapshot delegate, Debug implementation and appended typed Cancelled variant, plus the already-red Go fixture. The core and Cargo.lock remain byte-identical to the accepted native core. The binding uses the existing token and original call, not a detached read goroutine or another owner registry.
+
+An initial core-only library build at 17e succeeded, but generation correctly produced the old, identical bindings; the reused verifier returned status1 because it expected a changed binding. No Go behavior ran. Original generation21164 and all four helpers joined and its exact local gate released. Receipt `72606b4059576119161106309d86ad196065246d1ae75acd6a938a6cee869088` is preserved. This exposed that the reviewed binding patch was still scratch-only. It is not a native behavioral failure.
+
+After applying that patch, K built a genuine debug library using Rust1.91.1, locked/offline Cargo, two jobs and the existing private target. Only slatedb and slatedb-uniffi package artifacts were invalidated; both emitted artifacts had fresh=false and exact source paths/hashes. Canonical installed044 and its16b51 release library were unchanged. Cargo170717 took45.070998s with sampled process-group peak1,775,198,208B; remote170703 completed50.150368s and exact-released18:03:44.950084Z. All seven local and three remote originals joined. Raw receipt `889242e249952d7463c123d1794afb21cf630680393eec9771212265594d1ada`, outer `4e05af75199a5947f4d0e14d1192eaddc3ed640d539fceb9ca80e96fc95ce37a`, immutable archive `d85a7acd2e6cfb4d9c3c4f6da325d0d371e4969975d6059b1e1618091bcbd56e`.
+
+The library is `5c23cdf5c08199a1d03682401b3e2df7b061c82fdfddcabc2c59be9aaa0fe6d1`,270,548,000bytes. All four runtime dependency hashes match the original044 environment. The exact retained binary is in the private K attempt, not installed over canonical native paths. Build command:
+
+```sh
+cargo clean --locked --offline -p slatedb -p slatedb-uniffi --target x86_64-unknown-linux-gnu --target-dir "$PRIVATE_TARGET"
+cargo build --locked --offline --jobs 2 --target x86_64-unknown-linux-gnu --message-format=json -p slatedb-uniffi --lib
+```
+
+Local generation reused the proven7020d7006ac3fbbe248f82657ff93f8270f99ae8 tool, version0.7.0+v0.31.0, binary457e6a26a3e6852c88ff22ca89471c9a4eec96501e6e696fe1bb1a9daf416d6c. It read those exact collected Linux library bytes, used the unchanged async-error workaround and gofmt, and performed no compiler build. Original47403/four helpers completed in3.892617s with exact local release. Receipt `2b439ee7402fc946c2cc2012f3a71e4cff003a918f4efcc47432cd89f5a3328f`. Generated Go is `5cb39d045492fe02b30b1ff5e5a6e45f0bd1c7c5630ca5f269b459f4696b3442`; header `95ba0f723396c8d15909fcf55bd7f529558574d8c52f0e149c8f5bf928e56821`. The header's generated trailing whitespace is preserved byte-for-byte rather than hand-edited.
+
+The first Go candidate reached zero tests: UniFFI represents optional Arc<CancellationToken> as **CancellationToken, but the prepared helper supplied a single pointer. The exact compiler diagnostic is preserved in raw `dbe442573851723f3cde4fe5372addab0b2c1276a4f86a95a09679a202389fdf`; original171271/all helpers joined and released18:12:24Z. The successor changes only optional-token shape: a real token supplies &token, while the fixture's absent token stays nil. Assertions were not relaxed and the native library was not rebuilt.
+
+Actual candidate source: application `2d64afc9c4b801487fc97ea56dcebe57890f0017`; generated Go/fixture source `02ff5c6c41788fa2935f70b9570581d246a01e7d`. The three binding parents cover Db, DbSnapshot, DbReader and DbReaderSnapshot: pre-cancel avoids Decode; cancellation while the original Decode is held joins before return; original decoder errors survive cancellation; every case reads again through the same view. The app parents exercise the four real Get paths, with retained original callbacks; three separate callback controls cover stopped, running and completed AfterFunc lifetimes.
+
+| Actual command group | Parents | Pass nodes | Fail | Skip |
+| --- | ---: | ---: | ---: | ---: |
+| Ordinary binding | 3 | 15 | 0 | 0 |
+| Ordinary app/callback | 5 | 13 | 0 | 0 |
+| Race binding | 3 | 15 | 0 | 0 |
+| Race app/callback | 5 | 13 | 0 | 0 |
+
+Both complete selected-package vets returned0. Go1.27.1, GOMAXPROCS2, `-p 2`, CGO1, module downloads disabled; every original test binary's loader trace named only the retained5c23 library. Commands use exact test patterns retained in the immutable receipt:
+
+```sh
+go test -p 2 -count=1 -json -timeout=90s -exec="$CHECKED_EXEC" -run "$EXACT_BINDING_OR_APP_CONTRACT" .
+go test -p 2 -count=1 -json -timeout=90s -exec="$CHECKED_EXEC" -race -run "$EXACT_BINDING_OR_APP_CONTRACT" .
+go vet -p 2 .
+```
+
+Original local60289 and remote171824, seven originals each, all joined with logs and loader hashes independently rechecked. Remote61.957617s/local96.308240s; exact K release18:16:13.562422Z. Source/archive/workspace/dependencies/installed044 remained unchanged. Raw `facd671853894778e6081427ee84db527f3064d3848c3b5e25ea569ebdf3f96d`, outer `413858b1df5361d926866884dcae9a039855a34d3035a8f5217acc090a1af067`, archive `a56ac36809d2a9616773c5ca74022d2bed9fef4f65ba43f32c41034ad672dfee`. Packet `f/native-read-cancellation/point-go-candidate-k-v2`, manifest477a37ff0c3ced67e3f40b386103604de0745c9f160cff22599de013565d5c76; RESULTS.json retains all exact local paths and counts.
+
+This is focused point binding/callback evidence. Complete affected Go/native suites, explicit binding omission controls, iterator Scan/Seek/Close cancellation, publication and the required shared checkout roll remain separate. No dependent merge or U-j/public erasure activation follows from these results. The isolated application branch predates K's d2a26ab80 actual-holder acknowledgement fix; any later coherent union must preserve that fix rather than revive identity-only retirement.
