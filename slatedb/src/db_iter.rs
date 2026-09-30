@@ -148,6 +148,7 @@ pub(crate) struct GetIterator {
     cancellation_token: Option<CancellationToken>,
     current: Option<Box<dyn RowEntryIterator + 'static>>,
     join_on_stop: bool,
+    report_cleanup_errors: bool,
 }
 
 impl GetIterator {
@@ -169,10 +170,14 @@ impl GetIterator {
             cancellation_token: None,
             current: None,
             join_on_stop: false,
+            report_cleanup_errors: false,
         }
     }
 
-    async fn stop(&mut self) {
+    async fn stop(&mut self) -> Result<(), SlateDBError> {
+        if self.report_cleanup_errors {
+            return self.close().await;
+        }
         if let Some(token) = &self.cancellation_token {
             token.cancel();
         }
@@ -186,6 +191,16 @@ impl GetIterator {
             .get_mut()
             .stop(self.join_on_stop || self.cancellation_token.is_some())
             .await;
+        Ok(())
+    }
+
+    async fn fail(&mut self, error: SlateDBError) -> SlateDBError {
+        let cleanup = self.stop().await;
+        if matches!(error, SlateDBError::Cancelled) {
+            cleanup.err().unwrap_or(error)
+        } else {
+            error
+        }
     }
 
     pub(crate) fn new(
@@ -204,6 +219,10 @@ impl GetIterator {
         // No metadata fetches between these sources can overlap.
         let mut iter = Self::with_lookahead(key, iters, 1);
         iter.join_on_stop = true;
+        // The on-disk point source retains its own short-circuit precedence.
+        // The outer iterator must preserve any error it actually receives
+        // from closing that source (in particular an exact-key Scan).
+        iter.report_cleanup_errors = true;
         iter
     }
 
@@ -248,6 +267,7 @@ impl GetIterator {
         iter.cancellation_token = token;
         iter.join_on_stop =
             !ctx.sst_iter_options.inline_point_read || iter.cancellation_token.is_some();
+        iter.report_cleanup_errors = !ctx.sst_iter_options.inline_point_read;
         Ok(iter)
     }
 }
@@ -285,8 +305,7 @@ impl RowEntryIterator for GetIterator {
                 match self.sources.get_mut().next().await {
                     Some(Ok(source)) => self.current = Some(source),
                     Some(Err(error)) => {
-                        self.stop().await;
-                        return Err(error);
+                        return Err(self.fail(error).await);
                     }
                     None => return Ok(None),
                 }
@@ -296,8 +315,7 @@ impl RowEntryIterator for GetIterator {
             let entry = match iter.next().await {
                 Ok(entry) => entry,
                 Err(error) => {
-                    self.stop().await;
-                    return Err(error);
+                    return Err(self.fail(error).await);
                 }
             };
             if let Some(entry) = entry {
@@ -305,7 +323,7 @@ impl RowEntryIterator for GetIterator {
                     ValueDeletable::Value(_) | ValueDeletable::Tombstone => {
                         // Merge operands need their base, but no older entries.
                         // The token read joins its existing window before return.
-                        self.stop().await;
+                        self.stop().await?;
                         if entry.value.is_tombstone() {
                             return Ok(None);
                         }
@@ -317,6 +335,15 @@ impl RowEntryIterator for GetIterator {
                             self.sources.get_mut().finish_window().await;
                         }
                         return Ok(Some(entry));
+                    }
+                }
+            }
+            if self.join_on_stop {
+                let cleanup = iter.close().await;
+                self.current = None;
+                if self.report_cleanup_errors {
+                    if let Err(error) = cleanup {
+                        return Err(self.fail(error).await);
                     }
                 }
             }

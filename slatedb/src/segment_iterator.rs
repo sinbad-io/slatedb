@@ -4,6 +4,7 @@ use futures::future::join;
 use futures::StreamExt;
 use std::collections::VecDeque;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::bytes_range::BytesRange;
@@ -66,10 +67,13 @@ impl RangeTreeIterators {
             .cancellation_token
             .as_ref()
             .map(tokio_util::sync::CancellationToken::child_token);
+        // Retire the original construction as a whole, including token-free
+        // reads. This flag never enters the cache path or cancels a caller.
+        let retiring = Arc::new(AtomicBool::new(false));
         // Range scans need both L0 and SR iterators, so build them in parallel
         let (l0, sr) = join(
-            build_l0_range_iters(&tree.l0, &ctx),
-            build_sr_range_iters(&tree.compacted, &ctx),
+            build_l0_range_iters(&tree.l0, &ctx, retiring.clone()),
+            build_sr_range_iters(&tree.compacted, &ctx, retiring),
         )
         .await;
         match (l0, sr) {
@@ -446,6 +450,7 @@ pub(crate) fn build_sr_point_iters(
 async fn build_l0_range_iters(
     l0: &VecDeque<SsTableView>,
     ctx: &SegmentScanContext,
+    retiring: Arc<AtomicBool>,
 ) -> Result<VecDeque<Box<dyn RowEntryIterator>>, SlateDBError> {
     let table_store = ctx.table_store.clone();
     let range = ctx.range.clone();
@@ -459,6 +464,7 @@ async fn build_l0_range_iters(
         l0.iter().cloned(),
         ctx.max_parallel,
         ctx.sst_iter_options.cancellation_token.clone(),
+        retiring,
         move |sst| {
             let table_store = table_store.clone();
             let range = range.clone();
@@ -485,6 +491,7 @@ async fn build_l0_range_iters(
 async fn build_sr_range_iters(
     compacted: &[SortedRun],
     ctx: &SegmentScanContext,
+    retiring: Arc<AtomicBool>,
 ) -> Result<VecDeque<Box<dyn RowEntryIterator>>, SlateDBError> {
     let range = ctx.range.clone();
     let overlapping: Vec<_> = compacted
@@ -500,6 +507,7 @@ async fn build_sr_range_iters(
         overlapping.into_iter(),
         ctx.max_parallel,
         ctx.sst_iter_options.cancellation_token.clone(),
+        retiring,
         move |sr| {
             let table_store = table_store.clone();
             let range = range.clone();
@@ -530,27 +538,31 @@ async fn build_range_iters<I, F, Fut>(
     inputs: I,
     max_parallel: usize,
     cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    retiring: Arc<AtomicBool>,
     build: F,
 ) -> Result<VecDeque<Box<dyn RowEntryIterator>>, SlateDBError>
 where
     I: IntoIterator,
     I::Item: Send,
-    F: Fn(I::Item) -> Fut + Send,
+    F: Fn(I::Item) -> Fut + Send + Sync,
     Fut: Future<Output = Result<Option<Box<dyn RowEntryIterator>>, SlateDBError>> + Send,
 {
+    let build = &build;
     let mut results =
         futures::stream::iter(inputs.into_iter().enumerate().map(move |(index, input)| {
             let cancellation_token = cancellation_token.clone();
-            let build = build(input);
+            let retiring = retiring.clone();
             async move {
-                if cancellation_token
-                    .as_ref()
-                    .is_some_and(|token| token.is_cancelled())
+                if retiring.load(Ordering::Acquire)
+                    || cancellation_token
+                        .as_ref()
+                        .is_some_and(|token| token.is_cancelled())
                 {
                     return (index, Err(SlateDBError::Cancelled));
                 }
-                let result = build.await;
+                let result = build(input).await;
                 if result.is_err() {
+                    retiring.store(true, Ordering::Release);
                     if let Some(token) = cancellation_token {
                         token.cancel();
                     }
@@ -652,7 +664,7 @@ mod tests {
     #[tokio::test]
     async fn scan_token_free_factory_error_does_not_start_queued_factory() {
         let record = Arc::new(RangeBuildProbe::default());
-        let result = build_range_iters(0..3, 1, None, |id| {
+        let result = build_range_iters(0..3, 1, None, Arc::new(AtomicBool::new(false)), |id| {
             record.started.lock().push(id);
             let record = record.clone();
             async move {
@@ -677,7 +689,7 @@ mod tests {
         let record = Arc::new(RangeBuildProbe::default());
         let original_record = record.clone();
         let mut original = tokio::spawn(async move {
-            build_range_iters(0..3, 2, None, |id| {
+            build_range_iters(0..3, 2, None, Arc::new(AtomicBool::new(false)), |id| {
                 original_record.started.lock().push(id);
                 let record = original_record.clone();
                 async move {
@@ -736,19 +748,25 @@ mod tests {
     #[tokio::test]
     async fn scan_token_free_factory_success_keeps_unordered_completion() {
         let record = Arc::new(RangeBuildProbe::default());
-        let mut build = Box::pin(build_range_iters(0..2, 2, None, |id| {
-            record.started.lock().push(id);
-            let record = record.clone();
-            async move {
-                if id == 0 {
-                    record.wait(&record.released).await;
+        let mut build = Box::pin(build_range_iters(
+            0..2,
+            2,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            |id| {
+                record.started.lock().push(id);
+                let record = record.clone();
+                async move {
+                    if id == 0 {
+                        record.wait(&record.released).await;
+                    }
+                    Ok(Some(Box::new(BuiltRangeProbe {
+                        record,
+                        entry: Some(RowEntry::new_value(b"key", &[id as u8], 1)),
+                    }) as Box<dyn RowEntryIterator>))
                 }
-                Ok(Some(Box::new(BuiltRangeProbe {
-                    record,
-                    entry: Some(RowEntry::new_value(b"key", &[id as u8], 1)),
-                }) as Box<dyn RowEntryIterator>))
-            }
-        }));
+            },
+        ));
         assert!(futures::poll!(build.as_mut()).is_pending());
         let started = record.started.lock().clone();
         record.release();
