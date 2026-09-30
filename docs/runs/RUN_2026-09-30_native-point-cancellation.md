@@ -96,3 +96,27 @@ The partial log does not contain an object-store latency measurement. Compilatio
 Evidence is under /private/tmp/om-fh-state/f/native-read-cancellation/native-point-behavior-k-v2/dispatch-20260930T123302Z-26965. The outer receipt is 1def3890fff0b61e4042790b997a6f73537146a0e5f997d3e22e32e98fc29511. The worker receipt is 7f5d26ec08d4b7c99586844f5059d814c8bdf9a2b08065f805d8b13d200d9fa9. The raw archive is 2de98fa82422217e03fe67f842f88c93c072028c455ee81d259dedb9e4154ae5. The command log is 39d2064fbac3fc9e9075814c35ff2e053b7902033c3dc1dd5d41ff516695ec45. All original log hashes match. PARTIAL-RESULT.json lists the twelve printed failures and the missing results.
 
 Source inspection found a fixture setup error. CancelErrorStore returns Generic on every armed range read. The default retry wrapper retries Generic without a limit. The fixture therefore withholds the terminal error that its assertion intends to inspect. The accepted successor sets object_store_max_retries to Some(0) only for the two error-precedence parents. This exposes one returned storage error without changing the production retry policy. The original 514 fixture lines and every behavior assertion remain intact.
+
+## Behavior attempt 3: baseline proof and stale candidate artifact
+
+The v3 baseline completed all fourteen expected assertion failures. Each parent then failed alone at its required assertion. No test was ignored. Source f3ef5d5693e825d7f20a1c5b8e072595c7e4fb15 compiled in 39.25 seconds. Its full command took 50.065385879 seconds, including 10.60 seconds of tests. The sampled group peak was 1,459,838,976 bytes.
+
+The exact command was:
+
+```sh
+/usr/bin/python3 /private/tmp/om-fh-state/f/native-read-cancellation/native-point-behavior-k-v3/dispatch-owned.py --root-authorized-slot
+```
+
+The candidate stage did not compile its production source. Cargo reported fresh=true for both the slatedb library and point_read_cancellation binary. Both records named the exact output paths from the baseline compile. Cargo finished that stage in 0.43 seconds and ran the existing binary. It printed fourteen failures, and each failed again alone. Those failures do not classify candidate production behavior. Candidate source 96674bce719249457073c245af168de4acdad102 remains unproved. The nine legacy controls and six omissions did not start.
+
+Both source archives were extracted before the baseline compile into the same retained private Cargo target. Their source hashes stayed correct. Archive source timestamps alone did not force a fresh candidate artifact. The successor must invalidate only the slatedb package artifacts in this private target. Cargo supports package-scoped cleanup with -p and an explicit target directory. The dependency cache remains retained. See the [Cargo clean contract](https://doc.rust-lang.org/cargo/commands/cargo-clean.html).
+
+The successor must record fresh compilation from the exact candidate source for each candidate or omission transition. Source hashes alone cannot prove the tested artifact. No production edit, test assertion change, retry change, or longer deadline follows from this failure. The completed baseline remains evidence for a later candidate-only continuation.
+
+Local original34413/session29564 and its seven transport children joined. The child IDs were 34415, 34433, 34449, 34983, 35005, 35768 and 35794. Worker owner141270 retained thirty original Cargo groups. All groups joined and disappeared. Its exact lock and owner inodes were [2049,3484497] and [2049,3484498]. Release completed at 12:52:20.717848Z. Independent readback found no gate.
+
+The worker took 101.205655624 seconds. The full dispatcher took 184.770851750 seconds. Both 558-file source inventories, Cargo.lock, packet inputs, tools, canonical044, library16b51 and four dependencies stayed unchanged. OOM stayed 0. No deadline extension or retry ran. K returned to the coordinator.
+
+Evidence is under /private/tmp/om-fh-state/f/native-read-cancellation/native-point-behavior-k-v3/dispatch-20260930T124921Z-34413. The outer receipt is 3f7b0327022818acf0e82428c9d43184ff8440e7eb5ccde12877579550a505a9. The worker receipt is 326d319dcd49b2af7ed117aeaab568ea7c08b1e75d59352597f741dcf7b0cf57. The raw archive is f421144809314913f82ad0dfbacb36a13f80061bde4cf0d379a2ff3d51c33f59. The baseline log is 1f433e92fbd8195264ca8db39392f5e6a35d6f102ba555cd13f4100c1c8b25f7. The candidate log is 80204e20892f36e03ad929cfffa417de08207521b1d8cbe1a3def85b06fd49d5. All seven local and thirty worker command logs match their receipt hashes.
+
+These local failure timings are not object-store latency measurements. The napkin's 15–30ms GET rate still does not describe compilation or held fixtures. The regional 121765.887ms request debt remains open. No native publication, binding change, scan closure, shared roll, or public erasure follows from this attempt.
