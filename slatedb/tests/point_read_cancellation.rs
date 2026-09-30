@@ -963,3 +963,335 @@ async fn cancelled_memory_cache_lookup_keeps_original_join() {
 async fn cancelled_hybrid_cache_lookup_keeps_original_join() {
     cancelled_cache_lookup_is_joined(true).await;
 }
+
+struct LookaheadCache {
+    inner: Arc<dyn DbCache>,
+    armed: AtomicBool,
+    selected: Arc<ReadHold>,
+    pending: Arc<ReadHold>,
+    filters: std::sync::Mutex<Vec<slatedb::db_cache::CachedKey>>,
+    original: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+async fn hold_cache_return(hold: Arc<ReadHold>) {
+    hold.active.fetch_add(1, SeqCst);
+    let retained = ActiveRead(hold.clone());
+    hold.started.fetch_add(1, SeqCst);
+    hold.changed.notify_waiters();
+    loop {
+        let changed = hold.changed.notified();
+        if hold.released.load(SeqCst) {
+            break;
+        }
+        changed.await;
+    }
+    drop(retained);
+}
+
+#[async_trait]
+impl DbCache for LookaheadCache {
+    async fn get_block(
+        &self,
+        key: &slatedb::db_cache::CachedKey,
+    ) -> Result<Option<CachedEntry>, slatedb::Error> {
+        self.inner.get_block(key).await
+    }
+
+    async fn get_index(
+        &self,
+        key: &slatedb::db_cache::CachedKey,
+    ) -> Result<Option<CachedEntry>, slatedb::Error> {
+        self.inner.get_index(key).await
+    }
+
+    async fn get_filter(
+        &self,
+        key: &slatedb::db_cache::CachedKey,
+    ) -> Result<Option<CachedEntry>, slatedb::Error> {
+        if !self.armed.load(SeqCst) {
+            return self.inner.get_filter(key).await;
+        }
+        let ordinal = {
+            let mut filters = self.filters.lock().unwrap();
+            filters.push(key.clone());
+            filters.len()
+        };
+        match ordinal {
+            2 => {
+                let result = self.inner.get_filter(key).await;
+                hold_cache_return(self.selected.clone()).await;
+                result
+            }
+            3 => {
+                let inner = self.inner.clone();
+                let key = key.clone();
+                let hold = self.pending.clone();
+                let (send, receive) = tokio::sync::oneshot::channel();
+                // Hold the return from the original Foyer lookup in its own task.
+                // This models its task boundary, not a physical disk stall.
+                let original = tokio::spawn(async move {
+                    let result = inner.get_filter(&key).await;
+                    hold_cache_return(hold).await;
+                    let _ = send.send(result);
+                });
+                let previous = self.original.lock().unwrap().replace(original);
+                assert!(
+                    previous.is_none(),
+                    "lookahead fixture replaced its original lookup"
+                );
+                receive.await.expect("lookahead cache sender disappeared")
+            }
+            _ => self.inner.get_filter(key).await,
+        }
+    }
+
+    async fn get_stats(
+        &self,
+        key: &slatedb::db_cache::CachedKey,
+    ) -> Result<Option<CachedEntry>, slatedb::Error> {
+        self.inner.get_stats(key).await
+    }
+
+    async fn insert(&self, key: slatedb::db_cache::CachedKey, value: CachedEntry) {
+        self.inner.insert(key, value).await
+    }
+
+    async fn remove(&self, key: &slatedb::db_cache::CachedKey) {
+        self.inner.remove(key).await
+    }
+
+    fn entry_count(&self) -> u64 {
+        self.inner.entry_count()
+    }
+
+    async fn flush_scope(&self, scope: u64) -> Result<(), slatedb::Error> {
+        self.inner.flush_scope(scope).await
+    }
+}
+
+async fn lookahead_store(tombstone: bool) -> Arc<dyn ObjectStore> {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let seed = Db::builder("point-cancellation", store.clone())
+        .with_settings(settings())
+        .with_db_cache_disabled()
+        .build()
+        .await
+        .unwrap();
+    seed.put(KEY, b"old-value").await.unwrap();
+    seed.flush_with_options(FlushOptions {
+        flush_type: FlushType::MemTable,
+    })
+    .await
+    .unwrap();
+    if tombstone {
+        seed.delete(KEY).await.unwrap();
+    } else {
+        seed.put(KEY, VALUE).await.unwrap();
+    }
+    seed.flush_with_options(FlushOptions {
+        flush_type: FlushType::MemTable,
+    })
+    .await
+    .unwrap();
+    // The newest table covers KEY but does not contain it.
+    seed.put(b"point-j", b"before").await.unwrap();
+    seed.put(b"point-l", b"after").await.unwrap();
+    seed.flush_with_options(FlushOptions {
+        flush_type: FlushType::MemTable,
+    })
+    .await
+    .unwrap();
+    seed.close().await.unwrap();
+    store
+}
+
+async fn point_joins_started_lookahead(
+    reader: bool,
+    snapshot: bool,
+    cancel: bool,
+    tombstone: bool,
+) {
+    let directory = TempDir::new().unwrap();
+    let inner = cache(true, directory.path()).await;
+    let cache = Arc::new(LookaheadCache {
+        inner: inner.clone(),
+        armed: AtomicBool::new(false),
+        selected: ReadHold::new(),
+        pending: ReadHold::new(),
+        filters: std::sync::Mutex::new(Vec::new()),
+        original: std::sync::Mutex::new(None),
+    });
+    let db = open_original(
+        lookahead_store(tombstone).await,
+        cache.clone(),
+        reader,
+        Some(0),
+    )
+    .await;
+    let manifest = db.manifest();
+    assert_eq!(
+        manifest.l0().len(),
+        3,
+        "fixture requires three original L0 tables"
+    );
+    for table in manifest.l0() {
+        db.warm_sst(table.sst.id, &[CacheTarget::Filters, CacheTarget::Index])
+            .await
+            .unwrap();
+    }
+    cache.flush_scope(1).await.unwrap();
+    let original_snapshot = db.snapshot().await.unwrap();
+    let token = CancellationToken::new();
+    let options = ReadOptions {
+        cancellation_token: Some(token.clone()),
+        ..ReadOptions::default()
+    };
+    cache.armed.store(true, SeqCst);
+    let mut original = tokio::spawn({
+        let db = db.clone();
+        let original_snapshot = original_snapshot.clone();
+        async move {
+            if snapshot {
+                original_snapshot.get_with_options(KEY, &options).await
+            } else {
+                db.get_with_options(KEY, &options).await
+            }
+        }
+    });
+    let selected_started = timeout(Duration::from_secs(2), cache.selected.wait_started(1)).await;
+    let pending_started = timeout(Duration::from_secs(2), cache.pending.wait_started(1)).await;
+    if cancel {
+        token.cancel();
+    }
+    cache.selected.release();
+    let selected_joined = timeout(Duration::from_secs(2), cache.selected.wait_empty()).await;
+    let early = timeout(Duration::from_millis(50), &mut original).await;
+    let active_before_release = cache.pending.active.load(SeqCst);
+    cache.pending.release();
+    let (returned_early, result) = match early {
+        Ok(result) => (true, result.unwrap()),
+        Err(_) => (
+            false,
+            timeout(Duration::from_secs(2), original)
+                .await
+                .unwrap()
+                .unwrap(),
+        ),
+    };
+    let original_lookup = cache.original.lock().unwrap().take();
+    let retained_original = original_lookup.is_some();
+    if let Some(original_lookup) = original_lookup {
+        timeout(Duration::from_secs(2), original_lookup)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let active_after_join = cache.pending.active.load(SeqCst);
+    let filters = cache.filters.lock().unwrap().clone();
+    cache.armed.store(false, SeqCst);
+    let next = original_snapshot.get(KEY).await;
+    drop(original_snapshot);
+    db.close().await.unwrap();
+    inner.close().await.unwrap();
+
+    assert!(
+        selected_started.is_ok(),
+        "selected source never entered its original cache lookup"
+    );
+    assert!(
+        pending_started.is_ok(),
+        "older source never entered its original cache lookup"
+    );
+    assert!(
+        selected_joined.is_ok(),
+        "selected source did not leave its cache hold"
+    );
+    assert!(
+        retained_original,
+        "fixture lost the original pending cache task"
+    );
+    assert_eq!(
+        filters.len(),
+        3,
+        "fixture did not visit exactly three filters"
+    );
+    assert!(
+        filters[0] != filters[1] && filters[0] != filters[2] && filters[1] != filters[2],
+        "fixture revisited a filter instead of starting three original sources"
+    );
+    assert_eq!(
+        active_before_release, 1,
+        "older original lookup did not remain held"
+    );
+    assert_eq!(
+        active_after_join, 0,
+        "older original lookup survived cleanup"
+    );
+    let expected = (!tombstone).then(|| Bytes::from_static(VALUE));
+    assert_eq!(
+        next.unwrap(),
+        expected,
+        "the same original view changed after cleanup"
+    );
+    if cancel {
+        assert!(
+            matches!(result, Err(ref e) if matches!(e.kind(), ErrorKind::Cancelled)),
+            "cancelled lookahead returned a value or wrong error: {result:?}"
+        );
+    } else {
+        assert_eq!(
+            result.unwrap(),
+            expected,
+            "lookahead changed the selected row"
+        );
+    }
+    assert!(
+        !returned_early,
+        "point read returned before its older original cache lookup joined"
+    );
+}
+
+#[tokio::test]
+async fn writer_hit_joins_started_lookahead() {
+    point_joins_started_lookahead(false, false, false, false).await;
+}
+
+#[tokio::test]
+async fn writer_snapshot_hit_joins_started_lookahead() {
+    point_joins_started_lookahead(false, true, false, false).await;
+}
+
+#[tokio::test]
+async fn reader_hit_joins_started_lookahead() {
+    point_joins_started_lookahead(true, false, false, false).await;
+}
+
+#[tokio::test]
+async fn reader_snapshot_hit_joins_started_lookahead() {
+    point_joins_started_lookahead(true, true, false, false).await;
+}
+
+#[tokio::test]
+async fn writer_cancellation_joins_started_lookahead() {
+    point_joins_started_lookahead(false, false, true, false).await;
+}
+
+#[tokio::test]
+async fn writer_snapshot_cancellation_joins_started_lookahead() {
+    point_joins_started_lookahead(false, true, true, false).await;
+}
+
+#[tokio::test]
+async fn reader_cancellation_joins_started_lookahead() {
+    point_joins_started_lookahead(true, false, true, false).await;
+}
+
+#[tokio::test]
+async fn reader_snapshot_cancellation_joins_started_lookahead() {
+    point_joins_started_lookahead(true, true, true, false).await;
+}
+
+#[tokio::test]
+async fn writer_tombstone_joins_started_lookahead() {
+    point_joins_started_lookahead(false, false, false, true).await;
+}
