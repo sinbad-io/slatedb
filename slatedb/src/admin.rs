@@ -13,6 +13,7 @@ use crate::error::SlateDBError;
 use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::VersionedManifest;
 use slatedb_common::clock::SystemClock;
+use slatedb_common::ObjectMetadata;
 
 use crate::retrying_object_store::RetryingObjectStore;
 use crate::seq_tracker::FindOption;
@@ -593,6 +594,15 @@ impl Admin {
             .map_err(Into::into)
     }
 
+    /// Lists the metadata under this database's prefix in the main store.
+    ///
+    /// A separate or custom WAL is outside this scope. The result describes
+    /// a completed listing, not an atomic snapshot or proof of deletion.
+    pub async fn list_main_objects(&self) -> Result<Vec<ObjectMetadata>, crate::Error> {
+        let main = self.retrying_store(ObjectStoreType::Main);
+        collect_prefix(&main, &self.path).await
+    }
+
     /// Deletes a database, stripping any checkpoints it pinned in parent
     /// databases (a clone) before removing its own objects. Works for plain and
     /// cloned dbs alike: a plain db just has no parent checkpoints to strip.
@@ -679,7 +689,10 @@ impl Admin {
     async fn list_prefix(&self, main: &Arc<dyn ObjectStore>) -> Result<Vec<String>, crate::Error> {
         let paths = collect_prefix(main, &self.path).await?;
         // track the dry run paths in a set since the WAL and db may overlap
-        let mut paths = paths.iter().map(Path::to_string).collect::<BTreeSet<_>>();
+        let mut paths = paths
+            .iter()
+            .map(|metadata| metadata.location.to_string())
+            .collect::<BTreeSet<_>>();
         let wal_paths = self
             .wal_admin
             .delete_wal(&self.path, true)
@@ -699,7 +712,8 @@ impl Admin {
         keep: Option<&Path>,
     ) -> Result<Vec<String>, crate::Error> {
         let mut deleted = Vec::new();
-        for path in collect_prefix(store, &self.path).await? {
+        for metadata in collect_prefix(store, &self.path).await? {
+            let path = metadata.location;
             if Some(&path) == keep {
                 continue;
             }
@@ -977,22 +991,22 @@ pub fn load_gcp() -> Result<Arc<dyn ObjectStore>, crate::Error> {
     })?) as Arc<dyn ObjectStore>)
 }
 
-/// Collects every object path under `prefix` in the given store.
+/// Collects the metadata under `prefix` in the given store.
 async fn collect_prefix(
     store: &Arc<dyn ObjectStore>,
     prefix: &Path,
-) -> Result<Vec<Path>, crate::Error> {
+) -> Result<Vec<ObjectMetadata>, crate::Error> {
     let mut listing = store.list(Some(prefix));
-    let mut paths = Vec::new();
+    let mut objects = Vec::new();
     while let Some(meta) = listing
         .next()
         .await
         .transpose()
         .map_err(SlateDBError::from)?
     {
-        paths.push(meta.location);
+        objects.push(ObjectMetadata::new(meta));
     }
-    Ok(paths)
+    Ok(objects)
 }
 
 #[cfg(test)]
