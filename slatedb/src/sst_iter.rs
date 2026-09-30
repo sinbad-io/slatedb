@@ -4305,4 +4305,115 @@ mod tests {
             "joined storage error was lost: {result:?}"
         );
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_stop_does_not_poll_unstarted_token_free_inline_read() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (store, sst, cache, _) = point_read_fixture().await;
+        evict_point_blocks(&cache).await;
+        cache.mode.store(1, SeqCst);
+        let mut iter = InternalSstIterator::for_key(
+            &sst,
+            b"k",
+            store.clone(),
+            SstIteratorOptions {
+                eager_spawn: true,
+                ..SstIteratorOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        // Load the real index and enqueue the actual block future without
+        // polling it. No cancellation token changes legacy cache ownership.
+        iter.ensure_metadata_loaded().await.unwrap();
+        assert!(iter.options.cancellation_token.is_none());
+        assert_eq!(iter.fetch_tasks.len(), 1);
+        assert_eq!(cache.started.load(SeqCst), 0);
+        let mut stop = Box::pin(iter.stop());
+        let first = futures::poll!(stop.as_mut());
+        let newly_started = cache.started.load(SeqCst);
+        cache.mode.store(0, SeqCst);
+        cache.release.notify_one();
+        let result = match first {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => {
+                tokio::time::timeout(std::time::Duration::from_secs(2), stop.as_mut())
+                    .await
+                    .unwrap()
+            }
+        };
+        drop(stop);
+        result.unwrap();
+        assert!(iter.fetch_tasks.is_empty());
+        let mut next = SstIterator::for_key_with_stats_initialized(
+            &sst,
+            b"k",
+            store,
+            SstIteratorOptions::default(),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(next.next().await.unwrap().unwrap().key.as_ref(), b"k");
+        assert!(next.next().await.unwrap().is_none());
+        assert_eq!(newly_started, 0, "cleanup polled an unopened inline read");
+        assert_eq!(cache.started.load(SeqCst), 0);
+        assert_eq!(cache.dropped.load(SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_stop_joins_started_token_free_inline_read() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (store, sst, cache, _) = point_read_fixture().await;
+        evict_point_blocks(&cache).await;
+        cache.mode.store(1, SeqCst);
+        let mut iter =
+            InternalSstIterator::for_key(&sst, b"k", store.clone(), SstIteratorOptions::default())
+                .unwrap()
+                .unwrap();
+        {
+            let mut init = Box::pin(iter.init());
+            assert!(futures::poll!(init.as_mut()).is_pending());
+            assert_eq!(cache.started.load(SeqCst), 1);
+        }
+        assert!(iter.options.cancellation_token.is_none());
+        assert_eq!(cache.dropped.load(SeqCst), 0);
+        let mut stop = Box::pin(iter.stop());
+        let first = futures::poll!(stop.as_mut());
+        let returned_early = first.is_ready();
+        let dropped_early = cache.dropped.load(SeqCst);
+        cache.mode.store(0, SeqCst);
+        cache.release.notify_one();
+        let result = match first {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => {
+                tokio::time::timeout(std::time::Duration::from_secs(2), stop.as_mut())
+                    .await
+                    .unwrap()
+            }
+        };
+        drop(stop);
+        result.unwrap();
+        assert!(iter.fetch_tasks.is_empty());
+        let mut next = SstIterator::for_key_with_stats_initialized(
+            &sst,
+            b"k",
+            store,
+            SstIteratorOptions::default(),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(next.next().await.unwrap().unwrap().key.as_ref(), b"k");
+        assert!(next.next().await.unwrap().is_none());
+        assert!(
+            !returned_early,
+            "cleanup dropped the original inline lookup"
+        );
+        assert_eq!(dropped_early, 0);
+        assert_eq!(cache.started.load(SeqCst), 1);
+        assert_eq!(cache.dropped.load(SeqCst), 1);
+    }
 }
