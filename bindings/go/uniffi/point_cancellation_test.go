@@ -77,7 +77,11 @@ func (f *pointTokenTransform) arm(fail bool) *pointTokenHold {
 }
 
 func pointTokenOptions(token *slatedb.CancellationToken) slatedb.ReadOptions {
-	return slatedb.ReadOptions{DurabilityFilter: slatedb.DurabilityLevelRemote, CacheBlocks: false, CancellationToken: token}
+	var option **slatedb.CancellationToken
+	if token != nil {
+		option = &token
+	}
+	return slatedb.ReadOptions{DurabilityFilter: slatedb.DurabilityLevelRemote, CacheBlocks: false, CancellationToken: option}
 }
 
 func pointTokenOpen(t *testing.T, surface string) (func(*slatedb.CancellationToken) pointTokenResult, *pointTokenTransform) {

@@ -935,7 +935,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_cancellationtoken_cancel()
 		})
-		if checksum != 41759 {
+		if checksum != 23824 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_cancellationtoken_cancel: UniFFI API checksum mismatch")
 		}
@@ -1370,6 +1370,15 @@ func uniffiCheckChecksums() {
 		if checksum != 54802 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreadersnapshot_get: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_dbreadersnapshot_get_with_options()
+		})
+		if checksum != 36900 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreadersnapshot_get_with_options: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -3814,20 +3823,16 @@ func (c FfiConverterBlockTransformer) register() {
 	C.uniffi_slatedb_uniffi_fn_init_callback_vtable_blocktransformer(&UniffiVTableCallbackInterfaceBlockTransformerINSTANCE)
 }
 
-// A handle that stops a foreground `Admin` loop such as `run_gc` or
-// `run_compactor`. Cancelling is idempotent and may happen from any thread
-// before or after the loop starts; a loop started with an already cancelled
-// token shuts down at once.
+// A handle that cancels a point read or a foreground `Admin` loop.
+// Repeated cancellation is safe. It can occur before or during the call.
 type CancellationTokenInterface interface {
-	// Requests shutdown of every loop holding this token.
+	// Requests cancellation of each read or loop that holds this token.
 	Cancel()
 	IsCancelled() bool
 }
 
-// A handle that stops a foreground `Admin` loop such as `run_gc` or
-// `run_compactor`. Cancelling is idempotent and may happen from any thread
-// before or after the loop starts; a loop started with an already cancelled
-// token shuts down at once.
+// A handle that cancels a point read or a foreground `Admin` loop.
+// Repeated cancellation is safe. It can occur before or during the call.
 type CancellationToken struct {
 	ffiObject FfiObject
 }
@@ -3838,7 +3843,7 @@ func NewCancellationToken() *CancellationToken {
 	}))
 }
 
-// Requests shutdown of every loop holding this token.
+// Requests cancellation of each read or loop that holds this token.
 func (_self *CancellationToken) Cancel() {
 	_pointer := _self.ffiObject.incrementPointer("*CancellationToken")
 	defer _self.ffiObject.decrementPointer()
@@ -6800,6 +6805,7 @@ func (_ FfiDestroyerDbReaderBuilder) Destroy(value *DbReaderBuilder) {
 // One reader state across all operations, without a garbage-collection pin.
 type DbReaderSnapshotInterface interface {
 	Get(key []byte) (*[]byte, error)
+	GetWithOptions(key []byte, options ReadOptions) (*[]byte, error)
 	ScanPrefixWithOptions(prefix []byte, subrange KeyRange, options ScanOptions) (*DbIterator, error)
 	ScanWithOptions(varRange KeyRange, options ScanOptions) (*DbIterator, error)
 }
@@ -6827,6 +6833,41 @@ func (_self *DbReaderSnapshot) Get(key []byte) (*[]byte, error) {
 		},
 		C.uniffi_slatedb_uniffi_fn_method_dbreadersnapshot_get(
 			_pointer, FfiConverterBytesINSTANCE.Lower(key)),
+		// pollFn
+		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_poll_rust_buffer(handle, continuation, data)
+		},
+		// freeFn
+		func(handle C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_free_rust_buffer(handle)
+		},
+	)
+
+	if err == nil {
+		return res, nil
+	}
+
+	return res, err
+}
+
+func (_self *DbReaderSnapshot) GetWithOptions(key []byte, options ReadOptions) (*[]byte, error) {
+	_pointer := _self.ffiObject.incrementPointer("*DbReaderSnapshot")
+	defer _self.ffiObject.decrementPointer()
+	res, err := uniffiRustCallAsync[*Error](
+		FfiConverterErrorINSTANCE,
+		// completeFn
+		func(handle C.uint64_t, status *C.RustCallStatus) RustBufferI {
+			res := C.ffi_slatedb_uniffi_rust_future_complete_rust_buffer(handle, status)
+			return GoRustBuffer{
+				inner: res,
+			}
+		},
+		// liftFn
+		func(ffi RustBufferI) *[]byte {
+			return FfiConverterOptionalBytesINSTANCE.Lift(ffi)
+		},
+		C.uniffi_slatedb_uniffi_fn_method_dbreadersnapshot_get_with_options(
+			_pointer, FfiConverterBytesINSTANCE.Lower(key), FfiConverterReadOptionsINSTANCE.Lower(options)),
 		// pollFn
 		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
 			C.ffi_slatedb_uniffi_rust_future_poll_rust_buffer(handle, continuation, data)
@@ -12258,6 +12299,8 @@ type ReadOptions struct {
 	FilterContext *FilterContext
 	// Optional caller-supplied tracing settings.
 	TracingOptions *TracingOptions
+	// Optional token for the original point call.
+	CancellationToken **CancellationToken
 }
 
 func (r *ReadOptions) Destroy() {
@@ -12266,6 +12309,7 @@ func (r *ReadOptions) Destroy() {
 	FfiDestroyerBool{}.Destroy(r.CacheBlocks)
 	FfiDestroyerOptionalFilterContext{}.Destroy(r.FilterContext)
 	FfiDestroyerOptionalTracingOptions{}.Destroy(r.TracingOptions)
+	FfiDestroyerOptionalCancellationToken{}.Destroy(r.CancellationToken)
 }
 
 type FfiConverterReadOptions struct{}
@@ -12283,6 +12327,7 @@ func (c FfiConverterReadOptions) Read(reader io.Reader) ReadOptions {
 		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterOptionalFilterContextINSTANCE.Read(reader),
 		FfiConverterOptionalTracingOptionsINSTANCE.Read(reader),
+		FfiConverterOptionalCancellationTokenINSTANCE.Read(reader),
 	}
 }
 
@@ -12300,6 +12345,7 @@ func (c FfiConverterReadOptions) Write(writer io.Writer, value ReadOptions) {
 	FfiConverterBoolINSTANCE.Write(writer, value.CacheBlocks)
 	FfiConverterOptionalFilterContextINSTANCE.Write(writer, value.FilterContext)
 	FfiConverterOptionalTracingOptionsINSTANCE.Write(writer, value.TracingOptions)
+	FfiConverterOptionalCancellationTokenINSTANCE.Write(writer, value.CancellationToken)
 }
 
 type FfiDestroyerReadOptions struct{}
@@ -13763,6 +13809,7 @@ var ErrErrorUnavailable = fmt.Errorf("ErrorUnavailable")
 var ErrErrorInvalid = fmt.Errorf("ErrorInvalid")
 var ErrErrorData = fmt.Errorf("ErrorData")
 var ErrErrorInternal = fmt.Errorf("ErrorInternal")
+var ErrErrorCancelled = fmt.Errorf("ErrorCancelled")
 
 // Variant structs
 // Transaction-specific failure.
@@ -13952,6 +13999,36 @@ func (self ErrorInternal) Is(target error) bool {
 	return target == ErrErrorInternal
 }
 
+// The caller cancelled the original point read.
+type ErrorCancelled struct {
+	Message string
+}
+
+// The caller cancelled the original point read.
+func NewErrorCancelled(
+	message string,
+) *Error {
+	return &Error{err: &ErrorCancelled{
+		Message: message}}
+}
+
+func (e ErrorCancelled) destroy() {
+	FfiDestroyerString{}.Destroy(e.Message)
+}
+
+func (err ErrorCancelled) Error() string {
+	return fmt.Sprint("Cancelled",
+		": ",
+
+		"Message=",
+		err.Message,
+	)
+}
+
+func (self ErrorCancelled) Is(target error) bool {
+	return target == ErrErrorCancelled
+}
+
 type FfiConverterError struct{}
 
 var FfiConverterErrorINSTANCE = FfiConverterError{}
@@ -13997,6 +14074,10 @@ func (c FfiConverterError) Read(reader io.Reader) *Error {
 		return &Error{&ErrorInternal{
 			Message: FfiConverterStringINSTANCE.Read(reader),
 		}}
+	case 7:
+		return &Error{&ErrorCancelled{
+			Message: FfiConverterStringINSTANCE.Read(reader),
+		}}
 	default:
 		panic(fmt.Sprintf("Unknown error code %d in FfiConverterError.Read()", errorID))
 	}
@@ -14023,6 +14104,9 @@ func (c FfiConverterError) Write(writer io.Writer, value *Error) {
 	case *ErrorInternal:
 		writeInt32(writer, 6)
 		FfiConverterStringINSTANCE.Write(writer, variantValue.Message)
+	case *ErrorCancelled:
+		writeInt32(writer, 7)
+		FfiConverterStringINSTANCE.Write(writer, variantValue.Message)
 	default:
 		_ = variantValue
 		panic(fmt.Sprintf("invalid error value `%v` in FfiConverterError.Write", value))
@@ -14044,6 +14128,8 @@ func (_ FfiDestroyerError) Destroy(value *Error) {
 	case ErrorData:
 		variantValue.destroy()
 	case ErrorInternal:
+		variantValue.destroy()
+	case ErrorCancelled:
 		variantValue.destroy()
 	default:
 		_ = variantValue
@@ -15264,6 +15350,47 @@ type FfiDestroyerOptionalBytes struct{}
 func (_ FfiDestroyerOptionalBytes) Destroy(value *[]byte) {
 	if value != nil {
 		FfiDestroyerBytes{}.Destroy(*value)
+	}
+}
+
+type FfiConverterOptionalCancellationToken struct{}
+
+var FfiConverterOptionalCancellationTokenINSTANCE = FfiConverterOptionalCancellationToken{}
+
+func (c FfiConverterOptionalCancellationToken) Lift(rb RustBufferI) **CancellationToken {
+	return LiftFromRustBuffer[**CancellationToken](c, rb)
+}
+
+func (_ FfiConverterOptionalCancellationToken) Read(reader io.Reader) **CancellationToken {
+	if readInt8(reader) == 0 {
+		return nil
+	}
+	temp := FfiConverterCancellationTokenINSTANCE.Read(reader)
+	return &temp
+}
+
+func (c FfiConverterOptionalCancellationToken) Lower(value **CancellationToken) C.RustBuffer {
+	return LowerIntoRustBuffer[**CancellationToken](c, value)
+}
+
+func (c FfiConverterOptionalCancellationToken) LowerExternal(value **CancellationToken) ExternalCRustBuffer {
+	return RustBufferFromC(LowerIntoRustBuffer[**CancellationToken](c, value))
+}
+
+func (_ FfiConverterOptionalCancellationToken) Write(writer io.Writer, value **CancellationToken) {
+	if value == nil {
+		writeInt8(writer, 0)
+	} else {
+		writeInt8(writer, 1)
+		FfiConverterCancellationTokenINSTANCE.Write(writer, *value)
+	}
+}
+
+type FfiDestroyerOptionalCancellationToken struct{}
+
+func (_ FfiDestroyerOptionalCancellationToken) Destroy(value **CancellationToken) {
+	if value != nil {
+		FfiDestroyerCancellationToken{}.Destroy(*value)
 	}
 }
 
