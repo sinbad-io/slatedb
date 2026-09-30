@@ -1306,3 +1306,622 @@ async fn writer_tombstone_joins_started_lookahead() {
 async fn writer_hit_joins_started_lookahead_without_opening_the_rest() {
     point_joins_started_lookahead(false, false, false, false, 3).await;
 }
+
+struct KeepMergeOperand;
+
+impl slatedb::MergeOperator for KeepMergeOperand {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        _existing: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, slatedb::MergeOperatorError> {
+        Ok(operand)
+    }
+}
+
+async fn lookahead_merge_store() -> Arc<dyn ObjectStore> {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let seed = Db::builder("point-cancellation", store.clone())
+        .with_settings(settings())
+        .with_merge_operator(Arc::new(KeepMergeOperand))
+        .with_db_cache_disabled()
+        .build()
+        .await
+        .unwrap();
+    seed.put(KEY, b"old-value").await.unwrap();
+    seed.flush_with_options(FlushOptions {
+        flush_type: FlushType::MemTable,
+    })
+    .await
+    .unwrap();
+    seed.merge(KEY, b"operand").await.unwrap();
+    seed.flush_with_options(FlushOptions {
+        flush_type: FlushType::MemTable,
+    })
+    .await
+    .unwrap();
+    seed.put(b"point-j", b"before").await.unwrap();
+    seed.put(b"point-l", b"after").await.unwrap();
+    seed.flush_with_options(FlushOptions {
+        flush_type: FlushType::MemTable,
+    })
+    .await
+    .unwrap();
+    seed.close().await.unwrap();
+    store
+}
+
+async fn merge_rejection_joins_started_lookahead(reader: bool, snapshot: bool) {
+    let directory = TempDir::new().unwrap();
+    let inner = cache(true, directory.path()).await;
+    let cache = Arc::new(LookaheadCache {
+        inner: inner.clone(),
+        armed: AtomicBool::new(false),
+        selected: ReadHold::new(),
+        pending: ReadHold::new(),
+        filters: std::sync::Mutex::new(Vec::new()),
+        original: std::sync::Mutex::new(None),
+    });
+    let db = open_original(
+        lookahead_merge_store().await,
+        cache.clone(),
+        reader,
+        Some(0),
+    )
+    .await;
+    let manifest = db.manifest();
+    assert_eq!(manifest.l0().len(), 3, "fixture lost an original L0 table");
+    for table in manifest.l0() {
+        db.warm_sst(table.sst.id, &[CacheTarget::Filters, CacheTarget::Index])
+            .await
+            .unwrap();
+    }
+    cache.flush_scope(1).await.unwrap();
+    let original_snapshot = db.snapshot().await.unwrap();
+    let token = CancellationToken::new();
+    let options = ReadOptions {
+        cancellation_token: Some(token.clone()),
+        ..ReadOptions::default()
+    };
+    cache.armed.store(true, SeqCst);
+    let mut original = tokio::spawn({
+        let db = db.clone();
+        let original_snapshot = original_snapshot.clone();
+        async move {
+            if snapshot {
+                original_snapshot.get_with_options(KEY, &options).await
+            } else {
+                db.get_with_options(KEY, &options).await
+            }
+        }
+    });
+    let selected_started = timeout(Duration::from_secs(2), cache.selected.wait_started(1)).await;
+    let pending_started = timeout(Duration::from_secs(2), cache.pending.wait_started(1)).await;
+    cache.selected.release();
+    let selected_joined = timeout(Duration::from_secs(2), cache.selected.wait_empty()).await;
+    let early = timeout(Duration::from_millis(50), &mut original).await;
+    let active_before_release = cache.pending.active.load(SeqCst);
+    cache.pending.release();
+    let (returned_early, result) = match early {
+        Ok(result) => (true, result.unwrap()),
+        Err(_) => (
+            false,
+            timeout(Duration::from_secs(2), original)
+                .await
+                .unwrap()
+                .unwrap(),
+        ),
+    };
+    let original_lookup = cache.original.lock().unwrap().take();
+    let retained_original = original_lookup.is_some();
+    if let Some(original_lookup) = original_lookup {
+        timeout(Duration::from_secs(2), original_lookup)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let active_after_join = cache.pending.active.load(SeqCst);
+    let filters = cache.filters.lock().unwrap().clone();
+    cache.armed.store(false, SeqCst);
+    let next = original_snapshot.get(b"point-j").await;
+    let same_error = original_snapshot.get(KEY).await;
+    drop(original_snapshot);
+    db.close().await.unwrap();
+    inner.close().await.unwrap();
+
+    assert!(
+        selected_started.is_ok(),
+        "selected source never entered its original cache lookup"
+    );
+    assert!(
+        pending_started.is_ok(),
+        "older source never entered its original cache lookup"
+    );
+    assert!(
+        selected_joined.is_ok(),
+        "selected source did not leave its cache hold"
+    );
+    assert!(
+        retained_original,
+        "fixture lost the original pending cache task"
+    );
+    assert_eq!(
+        filters.len(),
+        (3).min(5),
+        "point lookup started sources outside its original lookahead window"
+    );
+    let distinct: std::collections::HashSet<_> = filters.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        filters.len(),
+        "fixture revisited an original filter"
+    );
+
+    assert_eq!(
+        active_before_release, 1,
+        "older original lookup did not remain held"
+    );
+    assert_eq!(
+        active_after_join, 0,
+        "older original lookup survived cleanup"
+    );
+    assert_eq!(
+        next.unwrap(),
+        Some(Bytes::from_static(b"before")),
+        "the same original view failed after cleanup"
+    );
+    for result in [result, same_error] {
+        let error = result.expect_err("merge operand returned bytes without its required operator");
+        assert!(
+            matches!(error.kind(), ErrorKind::Invalid),
+            "merge error category changed: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("merge operator missing"),
+            "original merge error was lost: {error:?}"
+        );
+    }
+    assert!(
+        !returned_early,
+        "merge rejection returned before its older original cache lookup joined"
+    );
+}
+
+#[tokio::test]
+async fn multisource_boundary_writer_merge_rejection_joins_started_lookahead() {
+    merge_rejection_joins_started_lookahead(false, false).await;
+}
+
+#[tokio::test]
+async fn multisource_boundary_writer_snapshot_merge_rejection_joins_started_lookahead() {
+    merge_rejection_joins_started_lookahead(false, true).await;
+}
+
+#[tokio::test]
+async fn multisource_boundary_reader_merge_rejection_joins_started_lookahead() {
+    merge_rejection_joins_started_lookahead(true, false).await;
+}
+
+#[tokio::test]
+async fn multisource_boundary_reader_snapshot_merge_rejection_joins_started_lookahead() {
+    merge_rejection_joins_started_lookahead(true, true).await;
+}
+
+#[derive(Debug)]
+struct LookaheadErrorStore {
+    inner: Arc<dyn ObjectStore>,
+    target: std::sync::Mutex<Option<Path>>,
+    armed: AtomicBool,
+    errors: AtomicUsize,
+    changed: Notify,
+}
+
+impl std::fmt::Display for LookaheadErrorStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LookaheadErrorStore({})", self.inner)
+    }
+}
+
+impl LookaheadErrorStore {
+    async fn wait_error(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.errors.load(SeqCst) != 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+#[async_trait]
+impl ObjectStore for LookaheadErrorStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, options).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        if self.armed.load(SeqCst)
+            && options.range.is_some()
+            && self.target.lock().unwrap().as_ref() == Some(location)
+        {
+            self.errors.fetch_add(1, SeqCst);
+            self.changed.notify_waiters();
+            return Err(object_store::Error::Generic {
+                store: "lookahead-error-fixture",
+                source: Box::new(std::io::Error::other("original lookahead storage failure")),
+            });
+        }
+        self.inner.get_opts(location, options).await
+    }
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+async fn lookahead_error_order(reader: bool, snapshot: bool, selected_error: bool) {
+    for tombstone in [false, true] {
+        // A tombstone has no value to decode; the selected-error case needs only a value.
+        if selected_error && tombstone {
+            continue;
+        }
+        let directory = TempDir::new().unwrap();
+        let store = Arc::new(LookaheadErrorStore {
+            inner: lookahead_store(tombstone, 0).await,
+            target: std::sync::Mutex::new(None),
+            armed: AtomicBool::new(false),
+            errors: AtomicUsize::new(0),
+            changed: Notify::new(),
+        });
+        let inner = cache(true, directory.path()).await;
+        let cache = Arc::new(LookaheadCache {
+            inner: inner.clone(),
+            armed: AtomicBool::new(false),
+            selected: ReadHold::new(),
+            pending: ReadHold::new(),
+            filters: std::sync::Mutex::new(Vec::new()),
+            original: std::sync::Mutex::new(None),
+        });
+        let db = open_original(store.clone(), cache.clone(), reader, Some(0)).await;
+        let manifest = db.manifest();
+        assert_eq!(manifest.l0().len(), 3);
+        for table in manifest.l0() {
+            db.warm_sst(table.sst.id, &[CacheTarget::Filters, CacheTarget::Index])
+                .await
+                .unwrap();
+        }
+        cache.flush_scope(1).await.unwrap();
+        let target = &manifest.l0()[if selected_error { 1 } else { 2 }];
+        *store.target.lock().unwrap() = Some(Path::from(format!(
+            "point-cancellation/compacted/{}.sst",
+            target.sst.id.value()
+        )));
+        let view = db.snapshot().await.unwrap();
+        let token = CancellationToken::new();
+        let options = ReadOptions {
+            cancellation_token: Some(token.clone()),
+            ..ReadOptions::default()
+        };
+        store.armed.store(true, SeqCst);
+        cache.armed.store(true, SeqCst);
+        let mut original = tokio::spawn({
+            let db = db.clone();
+            let view = view.clone();
+            async move {
+                if snapshot {
+                    view.get_with_options(KEY, &options).await
+                } else {
+                    db.get_with_options(KEY, &options).await
+                }
+            }
+        });
+        let selected_started =
+            timeout(Duration::from_secs(2), cache.selected.wait_started(1)).await;
+        let pending_started = timeout(Duration::from_secs(2), cache.pending.wait_started(1)).await;
+        if selected_error {
+            cache.selected.release();
+        } else {
+            cache.pending.release();
+        }
+        let error_observed = timeout(Duration::from_secs(2), store.wait_error()).await;
+        let early = if selected_error {
+            Some(timeout(Duration::from_millis(50), &mut original).await)
+        } else {
+            None
+        };
+        let pending_held = cache.pending.active.load(SeqCst);
+        cache.selected.release();
+        cache.pending.release();
+        let (returned_early, result) = match early {
+            Some(Ok(result)) => (true, result.unwrap()),
+            _ => (
+                false,
+                timeout(Duration::from_secs(2), original)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            ),
+        };
+        let lookup = cache.original.lock().unwrap().take();
+        let retained_original = lookup.is_some();
+        if let Some(lookup) = lookup {
+            timeout(Duration::from_secs(2), lookup)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let active_after = cache.pending.active.load(SeqCst);
+        let filters = cache.filters.lock().unwrap().clone();
+        let errors = store.errors.load(SeqCst);
+        store.armed.store(false, SeqCst);
+        cache.armed.store(false, SeqCst);
+        let next = view.get(KEY).await;
+        drop(view);
+        db.close().await.unwrap();
+        inner.close().await.unwrap();
+        assert!(
+            selected_started.is_ok() && pending_started.is_ok(),
+            "original selected and sibling cache lookups did not both start"
+        );
+        assert!(
+            error_observed.is_ok(),
+            "the exact selected SST did not produce its storage error"
+        );
+        assert!(
+            retained_original,
+            "original sibling lookup was not retained"
+        );
+        assert_eq!(active_after, 0, "original sibling survived fixture cleanup");
+        assert_eq!(filters.len(), 3, "source window changed");
+        assert_eq!(errors, 1, "fixture retry policy or selected SST changed");
+        assert!(
+            !token.is_cancelled(),
+            "unused child cancellation escaped to original caller token"
+        );
+        let expected = (!tombstone).then(|| Bytes::from_static(VALUE));
+        assert_eq!(
+            next.unwrap(),
+            expected,
+            "same original snapshot changed after error"
+        );
+        if selected_error {
+            let error = result.expect_err("selected storage failure returned a value");
+            assert!(
+                matches!(error.kind(), ErrorKind::Unavailable),
+                "selected error category changed: {error:?}"
+            );
+            assert!(
+                format!("{error:?}").contains("original lookahead storage failure"),
+                "selected error cause changed: {error:?}"
+            );
+            assert_eq!(
+                pending_held, 1,
+                "original sibling was not held when error returned"
+            );
+            assert!(
+                !returned_early,
+                "selected storage error returned before its older original cache lookup joined"
+            );
+        } else {
+            assert_eq!(
+                result.unwrap(),
+                expected,
+                "unused sibling error replaced the selected row"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn multisource_boundary_writer_selected_error_joins_started_lookahead() {
+    lookahead_error_order(false, false, true).await;
+}
+#[tokio::test]
+async fn multisource_boundary_writer_snapshot_selected_error_joins_started_lookahead() {
+    lookahead_error_order(false, true, true).await;
+}
+#[tokio::test]
+async fn multisource_boundary_reader_selected_error_joins_started_lookahead() {
+    lookahead_error_order(true, false, true).await;
+}
+#[tokio::test]
+async fn multisource_boundary_reader_snapshot_selected_error_joins_started_lookahead() {
+    lookahead_error_order(true, true, true).await;
+}
+#[tokio::test]
+async fn multisource_boundary_writer_unused_lookahead_error_keeps_selected_row() {
+    lookahead_error_order(false, false, false).await;
+}
+#[tokio::test]
+async fn multisource_boundary_writer_snapshot_unused_lookahead_error_keeps_selected_row() {
+    lookahead_error_order(false, true, false).await;
+}
+#[tokio::test]
+async fn multisource_boundary_reader_unused_lookahead_error_keeps_selected_row() {
+    lookahead_error_order(true, false, false).await;
+}
+#[tokio::test]
+async fn multisource_boundary_reader_snapshot_unused_lookahead_error_keeps_selected_row() {
+    lookahead_error_order(true, true, false).await;
+}
+
+// Entries come from actual warming. Returning them synchronously makes the
+// queued-but-unpolled boundary deterministic; this is not a physical cache test.
+struct ReadyLookaheadCache {
+    inner: Arc<dyn DbCache>,
+    entries: std::sync::Mutex<std::collections::HashMap<slatedb::db_cache::CachedKey, CachedEntry>>,
+    armed: AtomicBool,
+    filters: std::sync::Mutex<Vec<slatedb::db_cache::CachedKey>>,
+}
+
+#[async_trait]
+impl DbCache for ReadyLookaheadCache {
+    async fn get_block(
+        &self,
+        key: &slatedb::db_cache::CachedKey,
+    ) -> Result<Option<CachedEntry>, slatedb::Error> {
+        if self.armed.load(SeqCst) {
+            return Ok(self.entries.lock().unwrap().get(key).cloned());
+        }
+        self.inner.get_block(key).await
+    }
+    async fn get_index(
+        &self,
+        key: &slatedb::db_cache::CachedKey,
+    ) -> Result<Option<CachedEntry>, slatedb::Error> {
+        if self.armed.load(SeqCst) {
+            return Ok(self.entries.lock().unwrap().get(key).cloned());
+        }
+        self.inner.get_index(key).await
+    }
+    async fn get_filter(
+        &self,
+        key: &slatedb::db_cache::CachedKey,
+    ) -> Result<Option<CachedEntry>, slatedb::Error> {
+        if self.armed.load(SeqCst) {
+            self.filters.lock().unwrap().push(key.clone());
+            return Ok(self.entries.lock().unwrap().get(key).cloned());
+        }
+        self.inner.get_filter(key).await
+    }
+    async fn get_stats(
+        &self,
+        key: &slatedb::db_cache::CachedKey,
+    ) -> Result<Option<CachedEntry>, slatedb::Error> {
+        if self.armed.load(SeqCst) {
+            return Ok(self.entries.lock().unwrap().get(key).cloned());
+        }
+        self.inner.get_stats(key).await
+    }
+    async fn insert(&self, key: slatedb::db_cache::CachedKey, value: CachedEntry) {
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(key.clone(), value.clone());
+        self.inner.insert(key, value).await;
+    }
+    async fn remove(&self, key: &slatedb::db_cache::CachedKey) {
+        self.entries.lock().unwrap().remove(key);
+        self.inner.remove(key).await;
+    }
+    fn entry_count(&self) -> u64 {
+        self.inner.entry_count()
+    }
+    async fn flush_scope(&self, scope: u64) -> Result<(), slatedb::Error> {
+        self.inner.flush_scope(scope).await
+    }
+}
+
+async fn ready_hit_does_not_start_queued_lookahead(reader: bool, snapshot: bool) {
+    for tombstone in [false, true] {
+        let directory = TempDir::new().unwrap();
+        let inner = cache(true, directory.path()).await;
+        let store = Arc::new(HeldStore {
+            inner: lookahead_store(tombstone, 3).await,
+            hold: ReadHold::new(),
+            ranged_gets: AtomicUsize::new(0),
+        });
+        let cache = Arc::new(ReadyLookaheadCache {
+            inner: inner.clone(),
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            armed: AtomicBool::new(false),
+            filters: std::sync::Mutex::new(Vec::new()),
+        });
+        let db = open_original(store.clone(), cache.clone(), reader, Some(0)).await;
+        let manifest = db.manifest();
+        assert_eq!(manifest.l0().len(), 6);
+        for table in manifest.l0() {
+            db.warm_sst(table.sst.id, &CacheTarget::all())
+                .await
+                .unwrap();
+        }
+        cache.flush_scope(1).await.unwrap();
+        let view = db.snapshot().await.unwrap();
+        let token = CancellationToken::new();
+        let options = ReadOptions {
+            cancellation_token: Some(token.clone()),
+            ..ReadOptions::default()
+        };
+        let before = store.ranged_gets.load(SeqCst);
+        cache.armed.store(true, SeqCst);
+        let result = if snapshot {
+            view.get_with_options(KEY, &options).await
+        } else {
+            db.get_with_options(KEY, &options).await
+        };
+        let filters = cache.filters.lock().unwrap().clone();
+        let gets = store.ranged_gets.load(SeqCst) - before;
+        cache.armed.store(false, SeqCst);
+        let next = view.get(KEY).await;
+        drop(view);
+        db.close().await.unwrap();
+        inner.close().await.unwrap();
+        let expected = (!tombstone).then(|| Bytes::from_static(VALUE));
+        assert_eq!(result.unwrap(), expected, "ready selected row changed");
+        assert_eq!(next.unwrap(), expected, "same original snapshot changed");
+        assert_eq!(
+            filters.len(),
+            2,
+            "a queued but unpolled older source started its cache lookup"
+        );
+        assert_ne!(filters[0], filters[1], "the selected filter was read twice");
+        assert_eq!(
+            gets, 0,
+            "ready cache control unexpectedly performed object reads"
+        );
+        assert!(
+            !token.is_cancelled(),
+            "window cleanup cancelled original caller token"
+        );
+    }
+}
+
+#[tokio::test]
+async fn multisource_boundary_writer_ready_hit_does_not_start_queued_lookahead() {
+    ready_hit_does_not_start_queued_lookahead(false, false).await;
+}
+#[tokio::test]
+async fn multisource_boundary_writer_snapshot_ready_hit_does_not_start_queued_lookahead() {
+    ready_hit_does_not_start_queued_lookahead(false, true).await;
+}
+#[tokio::test]
+async fn multisource_boundary_reader_ready_hit_does_not_start_queued_lookahead() {
+    ready_hit_does_not_start_queued_lookahead(true, false).await;
+}
+#[tokio::test]
+async fn multisource_boundary_reader_snapshot_ready_hit_does_not_start_queued_lookahead() {
+    ready_hit_does_not_start_queued_lookahead(true, true).await;
+}
