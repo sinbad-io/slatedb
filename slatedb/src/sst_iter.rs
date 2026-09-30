@@ -4150,4 +4150,71 @@ mod tests {
             "fixture released the original lookup too early"
         );
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_seek_cancelled_parent_still_joins_original_prefetch() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (mut iter, cache, parent, originals) = held_scan_prefetch().await;
+        parent.cancel();
+        let mut seek = Box::pin(iter.seek(b"k025"));
+        let first_poll = futures::poll!(seek.as_mut());
+        let early = match first_poll {
+            std::task::Poll::Ready(result) => Some(result),
+            std::task::Poll::Pending => {
+                tokio::time::timeout(std::time::Duration::from_millis(100), seek.as_mut())
+                    .await
+                    .ok()
+            }
+        };
+        let returned_early = early.is_some();
+        cache.release();
+        let result = match early {
+            Some(result) => result,
+            None => tokio::time::timeout(std::time::Duration::from_secs(2), seek.as_mut())
+                .await
+                .unwrap(),
+        };
+        drop(seek);
+        settle_scan_fixture_tasks(&originals).await;
+        assert_eq!(cache.started.load(SeqCst), 1);
+        assert_eq!(cache.dropped.load(SeqCst), 1);
+        assert!(matches!(result, Err(SlateDBError::Cancelled)));
+        assert!(
+            !returned_early,
+            "cancelled Seek returned before original lookup joined"
+        );
+    }
+
+    // Two actual owned tasks finish with cancellation then storage failure in
+    // queue order. Cleanup must retain the storage error and settle both tasks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_seek_preserves_joined_storage_error_over_cancellation() {
+        let (mut iter, cache, parent, originals) = held_scan_prefetch().await;
+        cache.release();
+        settle_scan_fixture_tasks(&originals).await;
+        let inner = match &mut iter.delegate {
+            SstIteratorDelegate::Direct(inner) => inner,
+            SstIteratorDelegate::Filter(filtered) => &mut filtered.inner,
+        };
+        // Complete and remove only the fixture's already-joined data handles;
+        // the two following tasks are the exact replacement-window originals.
+        while inner.next_iter(false).await.unwrap().is_some() {}
+        let cancelled = tokio::spawn(async { Err(SlateDBError::Cancelled) });
+        let storage = tokio::spawn(async {
+            Err(SlateDBError::IoError(Arc::new(std::io::Error::other(
+                "scan owned storage failure",
+            ))))
+        });
+        let original_cancelled = cancelled.abort_handle();
+        let original_storage = storage.abort_handle();
+        inner.fetch_tasks.push_back(FetchTask::InFlight(cancelled));
+        inner.fetch_tasks.push_back(FetchTask::InFlight(storage));
+        let result = iter.seek(b"k025").await;
+        settle_scan_fixture_tasks(&[original_cancelled, original_storage]).await;
+        assert!(!parent.is_cancelled());
+        assert!(
+            matches!(result, Err(SlateDBError::IoError(ref error)) if error.to_string()=="scan owned storage failure"),
+            "joined storage error was lost: {result:?}"
+        );
+    }
 }
