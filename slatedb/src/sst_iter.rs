@@ -356,6 +356,9 @@ pub(crate) struct InternalSstIterator<'a> {
     next_block_idx_to_fetch: usize,
     block_idx_range: Range<usize>,
     fetch_tasks: VecDeque<FetchTask>,
+    // One child belongs to the current prefetch window. Seek retires this
+    // child, joins that window, then derives a fresh child from the caller.
+    fetch_token: Option<tokio_util::sync::CancellationToken>,
     table_store: Arc<TableStore>,
     options: SstIteratorOptions,
     tracing_context: Option<SstTracingContext>,
@@ -388,6 +391,10 @@ impl<'a> InternalSstIterator<'a> {
             next_block_idx_to_fetch: 0,
             block_idx_range: 0..0,
             fetch_tasks: VecDeque::new(),
+            fetch_token: options
+                .cancellation_token
+                .as_ref()
+                .map(|token| token.child_token()),
             table_store,
             options,
             tracing_context,
@@ -490,7 +497,7 @@ impl<'a> InternalSstIterator<'a> {
                     let table_store = self.table_store.clone();
                     let index = index.clone();
                     let cache_blocks = self.options.cache_blocks;
-                    let cancellation_token = self.options.cancellation_token.clone();
+                    let cancellation_token = self.fetch_token.clone();
                     let segment = self.options.segment.clone();
                     let blocks_end = blocks.end;
                     let single_block = blocks.len() == 1 && self.options.target_bytes_to_fetch == 1;
@@ -536,7 +543,7 @@ impl<'a> InternalSstIterator<'a> {
                     let table_store = self.table_store.clone();
                     let index = index.clone();
                     let cache_blocks = self.options.cache_blocks;
-                    let cancellation_token = self.options.cancellation_token.clone();
+                    let cancellation_token = self.fetch_token.clone();
                     let segment = self.options.segment.clone();
                     let blocks_start = blocks.start;
                     self.fetch_tasks
@@ -562,6 +569,15 @@ impl<'a> InternalSstIterator<'a> {
         &mut self,
         spawn_fetches: bool,
     ) -> Result<Option<DataBlockIterator<Arc<Block>>>, SlateDBError> {
+        if self
+            .options
+            .cancellation_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            self.finish_fetches().await?;
+            return Err(SlateDBError::Cancelled);
+        }
         if self.index.is_none() {
             return Ok(None);
         }
@@ -576,17 +592,25 @@ impl<'a> InternalSstIterator<'a> {
                     FetchTask::Inline(read) => {
                         // Keep the future in the queue if the caller cancels this
                         // next/init await: the block cursor has already advanced.
-                        let blocks = AssertUnwindSafe(read.get_mut())
+                        let result = AssertUnwindSafe(read.get_mut())
                             .catch_unwind()
                             .await
-                            .map_err(|panic| block_fetch_panic_error(panic, sst_id))??;
-                        *fetch_task = FetchTask::Finished(blocks);
+                            .map_err(|panic| block_fetch_panic_error(panic, sst_id))
+                            .and_then(|result| result);
+                        match result {
+                            Ok(blocks) => *fetch_task = FetchTask::Finished(blocks),
+                            Err(error) => return Err(self.finish_failed_fetch(error).await),
+                        }
                     }
                     FetchTask::InFlight(jh) => {
-                        let blocks = jh
+                        let result = jh
                             .await
-                            .map_err(|join_err| block_fetch_join_error(join_err, sst_id))??;
-                        *fetch_task = FetchTask::Finished(blocks);
+                            .map_err(|join_err| block_fetch_join_error(join_err, sst_id))
+                            .and_then(|result| result);
+                        match result {
+                            Ok(blocks) => *fetch_task = FetchTask::Finished(blocks),
+                            Err(error) => return Err(self.finish_failed_fetch(error).await),
+                        }
                     }
                     FetchTask::Finished(blocks) => {
                         // For descending order, pop from back; for ascending, pop from front
@@ -596,11 +620,15 @@ impl<'a> InternalSstIterator<'a> {
                         };
 
                         if let Some(block) = block {
-                            return Ok(Some(DataBlockIterator::new(
-                                block,
-                                sst_version,
-                                self.options.order,
-                            )?));
+                            match DataBlockIterator::new(block, sst_version, self.options.order) {
+                                Ok(block) => return Ok(Some(block)),
+                                Err(error) => {
+                                    // Decoding this selected block already failed.
+                                    // Join siblings without replacing that error.
+                                    let _ = self.finish_fetches().await;
+                                    return Err(error);
+                                }
+                            }
                         } else {
                             self.fetch_tasks.pop_front();
                         }
@@ -657,7 +685,53 @@ impl<'a> InternalSstIterator<'a> {
         Ok(())
     }
 
-    fn stop(&mut self) {
+    async fn finish_failed_fetch(&mut self, error: SlateDBError) -> SlateDBError {
+        // This original future completed with an error. Do not poll it twice.
+        self.fetch_tasks.pop_front();
+        let cleanup = self.finish_fetches().await;
+        if matches!(error, SlateDBError::Cancelled) {
+            cleanup.err().unwrap_or(error)
+        } else {
+            error
+        }
+    }
+
+    async fn finish_fetches(&mut self) -> Result<(), SlateDBError> {
+        if let Some(token) = &self.fetch_token {
+            token.cancel();
+        }
+        let mut failure = None;
+        while let Some(fetch) = self.fetch_tasks.front_mut() {
+            let result = match fetch {
+                FetchTask::InFlight(task) => task
+                    .await
+                    .map_err(|error| block_fetch_join_error(error, self.view.table_as_ref().sst.id))
+                    .and_then(|value| value.map(|_| ())),
+                FetchTask::Inline(read) => AssertUnwindSafe(read.get_mut())
+                    .catch_unwind()
+                    .await
+                    .map_err(|error| {
+                        block_fetch_panic_error(error, self.view.table_as_ref().sst.id)
+                    })
+                    .and_then(|value| value.map(|_| ())),
+                FetchTask::Finished(_) => Ok(()),
+            };
+            self.fetch_tasks.pop_front();
+            if let Err(error) = result {
+                // Cancellation is how this owner retires a window. Preserve
+                // the first observed non-cancellation failure in queue order.
+                if !matches!(error, SlateDBError::Cancelled) && failure.is_none() {
+                    failure = Some(error);
+                }
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn stop(&mut self) -> Result<(), SlateDBError> {
         if let Some(index) = self.index.as_ref() {
             // For ascending order, stopping means we've gone to the end
             // For descending order, stopping means we've gone to the beginning
@@ -672,6 +746,7 @@ impl<'a> InternalSstIterator<'a> {
             }
         }
         self.state.stop();
+        self.finish_fetches().await
     }
 
     async fn ensure_metadata_loaded(&mut self) -> Result<(), SlateDBError> {
@@ -727,7 +802,7 @@ impl<'a> InternalSstIterator<'a> {
                 Some(kv) => {
                     if !self.view.contains(&kv.key) {
                         if self.view.key_precedes(&kv.key) {
-                            self.stop();
+                            self.stop().await?;
                             break;
                         }
                         continue;
@@ -807,7 +882,7 @@ impl RowEntryIterator for InternalSstIterator<'_> {
                     if self.view.contains(&kv.key) {
                         return Ok(Some(kv));
                     } else if self.view.key_exceeds(&kv.key) {
-                        self.stop();
+                        self.stop().await?;
                     }
                 }
                 None => self.advance_block().await?,
@@ -826,7 +901,7 @@ impl RowEntryIterator for InternalSstIterator<'_> {
                     IterationOrder::Ascending => {
                         // Seeking beyond the end of the view range in ascending order
                         // means there are no more results.
-                        self.stop();
+                        self.stop().await?;
                         return Ok(());
                     }
                     IterationOrder::Descending => {
@@ -888,7 +963,20 @@ impl RowEntryIterator for InternalSstIterator<'_> {
                 }
             }
 
-            self.fetch_tasks.clear();
+            self.finish_fetches().await?;
+            if self
+                .options
+                .cancellation_token
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+            {
+                return Err(SlateDBError::Cancelled);
+            }
+            self.fetch_token = self
+                .options
+                .cancellation_token
+                .as_ref()
+                .map(|token| token.child_token());
             self.next_block_idx_to_fetch = match self.options.order {
                 IterationOrder::Ascending => block_idx,
                 IterationOrder::Descending => block_idx + 1,
