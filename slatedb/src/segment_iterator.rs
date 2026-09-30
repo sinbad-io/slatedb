@@ -538,55 +538,52 @@ where
     F: Fn(I::Item) -> Fut + Send,
     Fut: Future<Output = Result<Option<Box<dyn RowEntryIterator>>, SlateDBError>> + Send,
 {
-    let results = futures::stream::iter(inputs.into_iter().map(move |input| {
-        let cancellation_token = cancellation_token.clone();
-        let build = build(input);
-        async move {
-            if cancellation_token
-                .as_ref()
-                .is_some_and(|token| token.is_cancelled())
-            {
-                return Err(SlateDBError::Cancelled);
-            }
-            let result = build.await;
-            if result.is_err() {
-                if let Some(token) = cancellation_token {
-                    token.cancel();
-                }
-            }
-            result
-        }
-    }))
-    .buffered(max_parallel.max(1))
-    .collect::<Vec<_>>()
-    .await;
-    let mut ready = VecDeque::new();
-    let mut failure = None;
-    for result in results {
-        match result {
-            Ok(Some(iter)) => ready.push_back(iter),
-            Ok(None) => (),
-            Err(error) => {
-                if failure.is_none()
-                    || matches!(failure, Some(SlateDBError::Cancelled))
-                        && !matches!(error, SlateDBError::Cancelled)
+    let mut results =
+        futures::stream::iter(inputs.into_iter().enumerate().map(move |(index, input)| {
+            let cancellation_token = cancellation_token.clone();
+            let build = build(input);
+            async move {
+                if cancellation_token
+                    .as_ref()
+                    .is_some_and(|token| token.is_cancelled())
                 {
-                    failure = Some(error);
+                    return (index, Err(SlateDBError::Cancelled));
                 }
+                let result = build.await;
+                if result.is_err() {
+                    if let Some(token) = cancellation_token {
+                        token.cancel();
+                    }
+                }
+                (index, result)
             }
-        }
-    }
+        }))
+        .buffer_unordered(max_parallel.max(1))
+        .collect::<Vec<_>>()
+        .await;
+    let failure = results
+        .iter()
+        .filter_map(|(index, result)| result.as_ref().err().map(|error| (*index, error)))
+        .min_by_key(|(index, error)| (matches!(error, SlateDBError::Cancelled), *index))
+        .map(|(_, error)| error.clone());
     if let Some(mut error) = failure {
-        for iter in &mut ready {
-            if let Err(cleanup) = iter.close().await {
-                if matches!(error, SlateDBError::Cancelled) {
-                    error = cleanup;
+        results.sort_by_key(|(index, _)| *index);
+        for (_, result) in &mut results {
+            if let Ok(Some(iter)) = result {
+                if let Err(cleanup) = iter.close().await {
+                    if matches!(error, SlateDBError::Cancelled) {
+                        error = cleanup;
+                    }
                 }
             }
         }
         Err(error)
     } else {
-        Ok(ready)
+        // Preserve the existing successful factory completion order.
+        Ok(results
+            .into_iter()
+            .filter_map(|(_, result)| result.ok().flatten())
+            .collect())
     }
 }
 

@@ -528,12 +528,13 @@ impl DbIterator {
         } else {
             result
         };
-        if let Err(error) = result {
-            self.invalidated_error = Some(error);
-            self.close_inner().await?;
-            unreachable!("close retains the original error")
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.invalidated_error = Some(error.clone());
+                Err(self.close_inner().await.err().unwrap_or(error))
+            }
         }
-        result
     }
 
     /// Get the next key-value pair.
@@ -564,6 +565,7 @@ impl DbIterator {
 
     async fn next_entry_inner(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         if let Some(error) = self.invalidated_error.clone() {
+            self.close_inner().await?;
             Err(error)
         } else if self.closed {
             Ok(None)
@@ -621,6 +623,7 @@ impl DbIterator {
     pub async fn seek<K: AsRef<[u8]>>(&mut self, next_key: K) -> Result<(), crate::Error> {
         let next_key = next_key.as_ref();
         if let Some(error) = self.invalidated_error.clone() {
+            self.close_inner().await.map_err(crate::Error::from)?;
             Err(error.into())
         } else if self
             .cancellation_token
