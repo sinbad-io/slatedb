@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::future::try_join;
+use futures::future::join;
+use futures::StreamExt;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::Arc;
 
 use crate::bytes_range::BytesRange;
@@ -17,7 +19,6 @@ use crate::sorted_run_iterator::SortedRunIterator;
 use crate::sst_iter::{SstIterator, SstIteratorOptions, SstTracingContext};
 use crate::tablestore::TableStore;
 use crate::types::RowEntry;
-use crate::utils::build_concurrent;
 
 /// Inputs needed to construct a per-segment iterator. The scan path's
 /// [`SegmentMergeIterator`] holds an unbound template and clones it with the
@@ -59,13 +60,37 @@ struct RangeTreeIterators {
 
 impl RangeTreeIterators {
     async fn build(tree: &LsmTreeState, ctx: &SegmentScanContext) -> Result<Self, SlateDBError> {
+        let mut ctx = ctx.clone();
+        ctx.sst_iter_options.cancellation_token = ctx
+            .sst_iter_options
+            .cancellation_token
+            .as_ref()
+            .map(tokio_util::sync::CancellationToken::child_token);
         // Range scans need both L0 and SR iterators, so build them in parallel
-        let (l0, sr) = try_join(
-            build_l0_range_iters(&tree.l0, ctx),
-            build_sr_range_iters(&tree.compacted, ctx),
+        let (l0, sr) = join(
+            build_l0_range_iters(&tree.l0, &ctx),
+            build_sr_range_iters(&tree.compacted, &ctx),
         )
-        .await?;
-        Ok(Self { l0, sr })
+        .await;
+        match (l0, sr) {
+            (Ok(l0), Ok(sr)) => Ok(Self { l0, sr }),
+            (Err(error), Ok(mut sr)) | (Ok(mut sr), Err(error)) => {
+                let mut error = error;
+                for iter in &mut sr {
+                    if let Err(cleanup) = iter.close().await {
+                        if matches!(error, SlateDBError::Cancelled) {
+                            error = cleanup;
+                        }
+                    }
+                }
+                Err(error)
+            }
+            (Err(l0), Err(sr)) => Err(if matches!(l0, SlateDBError::Cancelled) {
+                sr
+            } else {
+                l0
+            }),
+        }
     }
 }
 
@@ -205,6 +230,15 @@ impl SegmentMergeIterator {
             self.children.front(),
             Some((_, SegmentIterState::Pending(_)))
         ) {
+            if self.context.as_ref().is_some_and(|context| {
+                context
+                    .sst_iter_options
+                    .cancellation_token
+                    .as_ref()
+                    .is_some_and(|token| token.is_cancelled())
+            }) {
+                return Err(SlateDBError::Cancelled);
+            }
             let (prefix, lazy) = self
                 .children
                 .pop_front()
@@ -224,9 +258,23 @@ impl SegmentMergeIterator {
             // `max_seq` filter can drop out-of-window entries before any
             // dedup decision is made (see comments in `db_iter::DbIterator::new`).
             let mut child: Box<dyn RowEntryIterator> = Box::new(merge.with_dedup(false));
-            child.init().await?;
+            if let Err(error) = child.init().await {
+                let cleanup = child.close().await;
+                return Err(if matches!(error, SlateDBError::Cancelled) {
+                    cleanup.err().unwrap_or(error)
+                } else {
+                    error
+                });
+            }
             if let Some(seek_key) = self.pending_seek.as_ref() {
-                child.seek(seek_key).await?;
+                if let Err(error) = child.seek(seek_key).await {
+                    let cleanup = child.close().await;
+                    return Err(if matches!(error, SlateDBError::Cancelled) {
+                        cleanup.err().unwrap_or(error)
+                    } else {
+                        error
+                    });
+                }
             }
             self.children
                 .push_front((prefix, SegmentIterState::Built(child)));
@@ -240,6 +288,22 @@ impl SegmentMergeIterator {
 
 #[async_trait]
 impl RowEntryIterator for SegmentMergeIterator {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        let mut failure = None;
+        while let Some((_, child)) = self.children.front_mut() {
+            if let SegmentIterState::Built(child) = child {
+                if let Err(error) = child.close().await {
+                    if failure.is_none() && !matches!(error, SlateDBError::Cancelled) {
+                        failure = Some(error);
+                    }
+                }
+            }
+            self.children.pop_front();
+        }
+        self.initialized = true;
+        failure.map_or(Ok(()), Err)
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         // Setting the flag is the only thing `init` needs to do. The
         // first child is built lazily on the first `next`/`seek`.
@@ -258,6 +322,7 @@ impl RowEntryIterator for SegmentMergeIterator {
             if let Some(entry) = child.next().await? {
                 return Ok(Some(entry));
             }
+            child.close().await?;
             self.children.pop_front();
         }
     }
@@ -268,8 +333,11 @@ impl RowEntryIterator for SegmentMergeIterator {
         }
         self.pending_seek = Some(Bytes::copy_from_slice(next_key));
         let drop_count = self.count_before(next_key);
-        if drop_count > 0 {
-            self.children.drain(..drop_count);
+        for _ in 0..drop_count {
+            if let Some((_, SegmentIterState::Built(child))) = self.children.front_mut() {
+                child.close().await?;
+            }
+            self.children.pop_front();
         }
         // If the new front is `Pending`, the build path applies
         // `pending_seek` (= `next_key`) atomically. If it's already
@@ -387,25 +455,30 @@ async fn build_l0_range_iters(
         ctx.read_trace.clone(),
     ));
     let stats = ctx.db_stats.clone();
-    build_concurrent(l0.iter().cloned(), ctx.max_parallel, move |sst| {
-        let table_store = table_store.clone();
-        let range = range.clone();
-        let opts = opts.clone();
-        let sst_tracing_context = sst_tracing_context.clone();
-        let stats = stats.clone();
-        async move {
-            SstIterator::new_owned_initialized_with_stats(
-                range,
-                sst,
-                table_store,
-                opts,
-                sst_tracing_context,
-                Some(stats),
-            )
-            .await
-            .map(|maybe| maybe.map(|i| Box::new(i) as Box<dyn RowEntryIterator>))
-        }
-    })
+    build_range_iters(
+        l0.iter().cloned(),
+        ctx.max_parallel,
+        ctx.sst_iter_options.cancellation_token.clone(),
+        move |sst| {
+            let table_store = table_store.clone();
+            let range = range.clone();
+            let opts = opts.clone();
+            let sst_tracing_context = sst_tracing_context.clone();
+            let stats = stats.clone();
+            async move {
+                SstIterator::new_owned_initialized_with_stats(
+                    range,
+                    sst,
+                    table_store,
+                    opts,
+                    sst_tracing_context,
+                    Some(stats),
+                )
+                .await
+                .map(|maybe| maybe.map(|i| Box::new(i) as Box<dyn RowEntryIterator>))
+            }
+        },
+    )
     .await
 }
 
@@ -423,29 +496,98 @@ async fn build_sr_range_iters(
     let opts = ctx.sst_iter_options.clone();
     let stats = ctx.db_stats.clone();
     let read_trace = ctx.read_trace.clone();
-    build_concurrent(overlapping.into_iter(), ctx.max_parallel, move |sr| {
-        let table_store = table_store.clone();
-        let range = range.clone();
-        let opts = opts.clone();
-        let sst_tracing_context = Some(SstTracingContext::new(
-            SstTraceLevel::SortedRun(sr.id),
-            read_trace.clone(),
-        ));
-        let stats = stats.clone();
-        async move {
-            SortedRunIterator::new_owned_initialized_with_stats(
-                range,
-                sr,
-                table_store,
-                opts,
-                sst_tracing_context,
-                Some(stats),
-            )
-            .await
-            .map(|iter| Some(Box::new(iter) as Box<dyn RowEntryIterator>))
-        }
-    })
+    build_range_iters(
+        overlapping.into_iter(),
+        ctx.max_parallel,
+        ctx.sst_iter_options.cancellation_token.clone(),
+        move |sr| {
+            let table_store = table_store.clone();
+            let range = range.clone();
+            let opts = opts.clone();
+            let sst_tracing_context = Some(SstTracingContext::new(
+                SstTraceLevel::SortedRun(sr.id),
+                read_trace.clone(),
+            ));
+            let stats = stats.clone();
+            async move {
+                SortedRunIterator::new_owned_initialized_with_stats(
+                    range,
+                    sr,
+                    table_store,
+                    opts,
+                    sst_tracing_context,
+                    Some(stats),
+                )
+                .await
+                .map(|iter| Some(Box::new(iter) as Box<dyn RowEntryIterator>))
+            }
+        },
+    )
     .await
+}
+
+async fn build_range_iters<I, F, Fut>(
+    inputs: I,
+    max_parallel: usize,
+    cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    build: F,
+) -> Result<VecDeque<Box<dyn RowEntryIterator>>, SlateDBError>
+where
+    I: IntoIterator,
+    I::Item: Send,
+    F: Fn(I::Item) -> Fut + Send,
+    Fut: Future<Output = Result<Option<Box<dyn RowEntryIterator>>, SlateDBError>> + Send,
+{
+    let results = futures::stream::iter(inputs.into_iter().map(move |input| {
+        let cancellation_token = cancellation_token.clone();
+        let build = build(input);
+        async move {
+            if cancellation_token
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+            {
+                return Err(SlateDBError::Cancelled);
+            }
+            let result = build.await;
+            if result.is_err() {
+                if let Some(token) = cancellation_token {
+                    token.cancel();
+                }
+            }
+            result
+        }
+    }))
+    .buffered(max_parallel.max(1))
+    .collect::<Vec<_>>()
+    .await;
+    let mut ready = VecDeque::new();
+    let mut failure = None;
+    for result in results {
+        match result {
+            Ok(Some(iter)) => ready.push_back(iter),
+            Ok(None) => (),
+            Err(error) => {
+                if failure.is_none()
+                    || matches!(failure, Some(SlateDBError::Cancelled))
+                        && !matches!(error, SlateDBError::Cancelled)
+                {
+                    failure = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(mut error) = failure {
+        for iter in &mut ready {
+            if let Err(cleanup) = iter.close().await {
+                if matches!(error, SlateDBError::Cancelled) {
+                    error = cleanup;
+                }
+            }
+        }
+        Err(error)
+    } else {
+        Ok(ready)
+    }
 }
 
 #[cfg(test)]
@@ -475,6 +617,10 @@ mod tests {
 
     #[async_trait]
     impl RowEntryIterator for VecIter {
+        async fn close(&mut self) -> Result<(), SlateDBError> {
+            Ok(())
+        }
+
         async fn init(&mut self) -> Result<(), SlateDBError> {
             self.initialized = true;
             Ok(())

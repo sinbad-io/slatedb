@@ -402,6 +402,7 @@ impl TryFrom<ScanOptions> for slatedb::config::ScanOptions {
 
     fn try_from(value: ScanOptions) -> Result<Self, Self::Error> {
         Ok(slatedb::config::ScanOptions {
+            cancellation_token: None,
             durability_filter: value.durability_filter.into(),
             dirty: value.dirty,
             read_ahead_bytes: usize::try_from(value.read_ahead_bytes).map_err(|_| {

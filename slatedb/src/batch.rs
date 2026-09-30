@@ -455,6 +455,10 @@ impl WriteBatchIterator {
 
 #[async_trait]
 impl RowEntryIterator for WriteBatchIterator {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        Ok(())
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         Ok(())
     }

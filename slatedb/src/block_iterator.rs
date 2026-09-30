@@ -111,6 +111,10 @@ pub(crate) struct BlockIterator<B: BlockLike> {
 
 #[async_trait]
 impl<B: BlockLike> RowEntryIterator for BlockIterator<B> {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        Ok(())
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         Ok(())
     }

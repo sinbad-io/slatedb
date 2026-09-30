@@ -15,25 +15,23 @@ struct MergeIteratorHeapEntry<'a> {
 
 impl<'a> MergeIteratorHeapEntry<'a> {
     /// Seek the iterator and return a new heap entry
-    async fn seek(
-        mut self,
-        next_key: &[u8],
-    ) -> Result<Option<MergeIteratorHeapEntry<'a>>, SlateDBError> {
-        if self.next_kv.key >= next_key {
-            Ok(Some(self))
+    async fn seek(mut self, next_key: &[u8]) -> (Self, Result<bool, SlateDBError>) {
+        let result = if self.next_kv.key >= next_key {
+            Ok(true)
         } else {
-            self.iterator.seek(next_key).await?;
-            if let Some(next_kv) = self.iterator.next().await? {
-                Ok(Some(MergeIteratorHeapEntry {
-                    next_kv,
-                    index: self.index,
-                    iterator: self.iterator,
-                    order: self.order,
-                }))
-            } else {
-                Ok(None)
+            match self.iterator.seek(next_key).await {
+                Ok(()) => match self.iterator.next().await {
+                    Ok(Some(next_kv)) => {
+                        self.next_kv = next_kv;
+                        Ok(true)
+                    }
+                    Ok(None) => Ok(false),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
             }
-        }
+        };
+        (self, result)
     }
 }
 
@@ -73,7 +71,7 @@ pub(crate) struct MergeIterator<'a> {
     /// Use a heap to perform merge sort.
     iterators: BinaryHeap<Reverse<MergeIteratorHeapEntry<'a>>>,
     /// Iterators that have not yet been initialized and seeded.
-    pending_iterators: Vec<(usize, Box<dyn RowEntryIterator + 'a>)>,
+    pending_iterators: VecDeque<(usize, Box<dyn RowEntryIterator + 'a>)>,
     /// Whether to deduplicate entries of multiple versions with the same key. It's enabled by
     /// default, but it is useful to disable when we want to have some merge logics during
     /// compaction.
@@ -124,15 +122,29 @@ impl<'a> MergeIterator<'a> {
             return Ok(());
         }
 
-        for (index, mut iterator) in self.pending_iterators.drain(..) {
-            iterator.init().await?;
-            if let Some(next_kv) = iterator.next().await? {
-                self.iterators.push(Reverse(MergeIteratorHeapEntry {
-                    next_kv,
-                    index,
-                    iterator,
-                    order: self.order,
-                }));
+        while let Some((index, mut iterator)) = self.pending_iterators.pop_front() {
+            let result = match iterator.init().await {
+                Ok(()) => iterator.next().await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(Some(next_kv)) => {
+                    self.iterators.push(Reverse(MergeIteratorHeapEntry {
+                        next_kv,
+                        index,
+                        iterator,
+                        order: self.order,
+                    }));
+                }
+                Ok(None) => {
+                    if let Err(error) = iterator.close().await {
+                        return Err(self.fail(error).await);
+                    }
+                }
+                Err(error) => {
+                    self.pending_iterators.push_front((index, iterator));
+                    return Err(self.fail(error).await);
+                }
             }
         }
         self.current = self.iterators.pop().map(|r| r.0);
@@ -151,13 +163,33 @@ impl<'a> MergeIterator<'a> {
         self.current.as_ref().map(|c| &c.next_kv)
     }
 
+    async fn fail(&mut self, error: SlateDBError) -> SlateDBError {
+        let cleanup = self.close().await;
+        if matches!(error, SlateDBError::Cancelled) {
+            cleanup.err().unwrap_or(error)
+        } else {
+            error
+        }
+    }
+
     async fn advance(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         self.ensure_initialized().await?;
         if let Some(mut iterator_state) = self.current.take() {
-            let current_kv = iterator_state.next_kv;
-            if let Some(kv) = iterator_state.iterator.next().await? {
-                iterator_state.next_kv = kv;
-                self.iterators.push(Reverse(iterator_state));
+            let current_kv = iterator_state.next_kv.clone();
+            match iterator_state.iterator.next().await {
+                Ok(Some(kv)) => {
+                    iterator_state.next_kv = kv;
+                    self.iterators.push(Reverse(iterator_state));
+                }
+                Ok(None) => {
+                    if let Err(error) = iterator_state.iterator.close().await {
+                        return Err(self.fail(error).await);
+                    }
+                }
+                Err(error) => {
+                    self.current = Some(iterator_state);
+                    return Err(self.fail(error).await);
+                }
             }
             self.current = self.iterators.pop().map(|r| r.0);
 
@@ -173,6 +205,31 @@ impl<'a> MergeIterator<'a> {
 
 #[async_trait]
 impl RowEntryIterator for MergeIterator<'_> {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        self.initialized = true;
+        if let Some(current) = self.current.take() {
+            self.pending_iterators
+                .push_back((current.index, current.iterator));
+        }
+        for entry in self.iterators.drain() {
+            self.pending_iterators
+                .push_back((entry.0.index, entry.0.iterator));
+        }
+        self.pending_iterators
+            .make_contiguous()
+            .sort_by_key(|entry| entry.0);
+        let mut failure = None;
+        while let Some((_, iterator)) = self.pending_iterators.front_mut() {
+            if let Err(error) = iterator.close().await {
+                if failure.is_none() && !matches!(error, SlateDBError::Cancelled) {
+                    failure = Some(error);
+                }
+            }
+            self.pending_iterators.pop_front();
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         self.initialize().await
     }
@@ -222,10 +279,31 @@ impl RowEntryIterator for MergeIterator<'_> {
             seek_futures.push_back(iterator.0.seek(next_key));
         }
 
-        for seek_result in futures::future::join_all(seek_futures).await {
-            if let Some(seeked_iterator) = seek_result? {
-                self.iterators.push(Reverse(seeked_iterator));
+        let mut failure = None;
+        for (mut iterator, result) in futures::future::join_all(seek_futures).await {
+            match result {
+                Ok(true) => self.iterators.push(Reverse(iterator)),
+                Ok(false) => {
+                    if let Err(error) = iterator.iterator.close().await {
+                        if failure.is_none() {
+                            failure = Some(error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.iterators.push(Reverse(iterator));
+                    if failure.is_none()
+                        || matches!(failure, Some(SlateDBError::Cancelled))
+                            && !matches!(error, SlateDBError::Cancelled)
+                    {
+                        failure = Some(error);
+                    }
+                }
             }
+        }
+
+        if let Some(error) = failure {
+            return Err(self.fail(error).await);
         }
 
         self.current = self.iterators.pop().map(|r| r.0);

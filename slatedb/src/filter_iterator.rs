@@ -32,6 +32,10 @@ impl<T: RowEntryIterator> FilterIterator<T> {
 
 #[async_trait]
 impl<T: RowEntryIterator> RowEntryIterator for FilterIterator<T> {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        self.iterator.close().await
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         self.iterator.init().await
     }

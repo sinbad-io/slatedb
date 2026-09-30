@@ -458,9 +458,30 @@ impl Reader {
         options: &ScanOptions,
         ctx: ScanContext<'_>,
     ) -> Result<DbIterator, SlateDBError> {
+        if options
+            .cancellation_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(SlateDBError::Cancelled);
+        }
+        let mut options = options.clone();
+        options.cancellation_token = options
+            .cancellation_token
+            .as_ref()
+            .map(tokio_util::sync::CancellationToken::child_token);
         let read_trace = Self::read_trace(options.tracing_options.as_ref());
-        let read = self.scan_with_options_inner(range, options, ctx, read_trace.clone());
-        read.instrument(read_trace.read_span()).await
+        let read = self.scan_with_options_inner(range, &options, ctx, read_trace.clone());
+        let mut iterator = read.instrument(read_trace.read_span()).await?;
+        if options
+            .cancellation_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            iterator.close_inner().await?;
+            return Err(SlateDBError::Cancelled);
+        }
+        Ok(iterator)
     }
 
     async fn scan_with_options_inner(
@@ -475,7 +496,7 @@ impl Reader {
 
         let sst_iter_options = SstIteratorOptions {
             inline_point_read: false,
-            cancellation_token: None,
+            cancellation_token: options.cancellation_token.clone(),
             max_fetch_tasks: options.max_fetch_tasks,
             target_bytes_to_fetch: options.read_ahead_bytes,
             cache_blocks: options.cache_blocks,
@@ -516,6 +537,7 @@ impl Reader {
             read_trace,
         )
         .await
+        .map(|iterator| iterator.with_cancellation_token(options.cancellation_token.clone()))
     }
 
     /// See [`crate::Db::scan_prefix_by_recency`].
@@ -538,6 +560,11 @@ impl Reader {
         options: &ScanOptions,
         db_state: &(dyn DbStateReader + Sync),
     ) -> Result<DbRecencyIterator, SlateDBError> {
+        if options.cancellation_token.is_some() {
+            return Err(SlateDBError::InvalidConfiguration(
+                "cancellation is not supported for recency scans".into(),
+            ));
+        }
         let read_trace = Self::read_trace(options.tracing_options.as_ref());
         let read = self.scan_prefix_by_recency_with_options_inner(
             prefix,

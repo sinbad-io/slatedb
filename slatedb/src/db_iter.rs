@@ -19,6 +19,8 @@ use futures::stream::{FuturesOrdered, StreamExt};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ops::RangeBounds;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -60,6 +62,7 @@ struct InitializedSources {
     pending: FuturesOrdered<BoxFuture<'static, InitializedSource>>,
     lookahead: usize,
     first: bool,
+    retiring: Arc<AtomicBool>,
 }
 
 impl InitializedSources {
@@ -69,6 +72,7 @@ impl InitializedSources {
             pending: FuturesOrdered::new(),
             lookahead: lookahead.max(1),
             first: true,
+            retiring: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -78,8 +82,23 @@ impl InitializedSources {
             let Some(mut iter) = self.remaining.next() else {
                 break;
             };
-            self.pending
-                .push_back(async move { iter.init().await.map(|()| iter) }.boxed());
+            let retiring = self.retiring.clone();
+            self.pending.push_back(
+                async move {
+                    if !retiring.load(Ordering::Acquire) {
+                        if let Err(error) = iter.init().await {
+                            let cleanup = iter.close().await;
+                            return Err(if matches!(error, SlateDBError::Cancelled) {
+                                cleanup.err().unwrap_or(error)
+                            } else {
+                                error
+                            });
+                        }
+                    }
+                    Ok(iter)
+                }
+                .boxed(),
+            );
         }
         let result = self.pending.next().await;
         self.first = false;
@@ -94,12 +113,32 @@ impl InitializedSources {
     }
 
     async fn stop(&mut self, join: bool) {
-        self.remaining = Vec::new().into_iter();
         if join {
-            while self.pending.next().await.is_some() {}
+            // Point short-circuiting keeps its existing unused-sibling error
+            // precedence. Explicit iterator Close returns cleanup failures.
+            let _ = self.close().await;
         } else {
+            self.remaining = Vec::new().into_iter();
             self.pending = FuturesOrdered::new();
         }
+    }
+
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        self.retiring.store(true, Ordering::Release);
+        self.remaining = Vec::new().into_iter();
+        let mut failure = None;
+        while let Some(result) = self.pending.next().await {
+            let result = match result {
+                Ok(mut iter) => iter.close().await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                if failure.is_none() && !matches!(error, SlateDBError::Cancelled) {
+                    failure = Some(error);
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -108,6 +147,7 @@ pub(crate) struct GetIterator {
     sources: Mutex<InitializedSources>,
     cancellation_token: Option<CancellationToken>,
     current: Option<Box<dyn RowEntryIterator + 'static>>,
+    join_on_stop: bool,
 }
 
 impl GetIterator {
@@ -128,17 +168,23 @@ impl GetIterator {
             sources: Mutex::new(InitializedSources::new(iters, lookahead)),
             cancellation_token: None,
             current: None,
+            join_on_stop: false,
         }
     }
 
     async fn stop(&mut self) {
-        self.current = None;
         if let Some(token) = &self.cancellation_token {
             token.cancel();
         }
+        if self.join_on_stop {
+            if let Some(current) = &mut self.current {
+                let _ = current.close().await;
+            }
+        }
+        self.current = None;
         self.sources
             .get_mut()
-            .stop(self.cancellation_token.is_some())
+            .stop(self.join_on_stop || self.cancellation_token.is_some())
             .await;
     }
 
@@ -156,7 +202,9 @@ impl GetIterator {
 
         // Each source is in memory or is the segment chain.
         // No metadata fetches between these sources can overlap.
-        Self::with_lookahead(key, iters, 1)
+        let mut iter = Self::with_lookahead(key, iters, 1);
+        iter.join_on_stop = true;
+        iter
     }
 
     /// Build a per-tree `GetIterator` over the L0 + sorted-run iterators
@@ -198,12 +246,31 @@ impl GetIterator {
         let iters = apply_filters(l0.into_iter().chain(sr), max_seq);
         let mut iter = Self::with_lookahead(key, iters, ctx.max_parallel);
         iter.cancellation_token = token;
+        iter.join_on_stop =
+            !ctx.sst_iter_options.inline_point_read || iter.cancellation_token.is_some();
         Ok(iter)
     }
 }
 
 #[async_trait]
 impl RowEntryIterator for GetIterator {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        if let Some(token) = &self.cancellation_token {
+            token.cancel();
+        }
+        let current = match &mut self.current {
+            Some(current) => current.close().await,
+            None => Ok(()),
+        };
+        self.current = None;
+        let pending = self.sources.get_mut().close().await;
+        match current {
+            Err(SlateDBError::Cancelled) => pending,
+            Err(_) => current,
+            Ok(()) => pending,
+        }
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         // GetIterator departs from the normal convention for RowEntryIterator
         // in that it lazily initializes the sources only when necessary - this
@@ -299,6 +366,10 @@ impl ScanIterator {
 
 #[async_trait]
 impl RowEntryIterator for ScanIterator {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        self.delegate.close().await
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         self.delegate.init().await
     }
@@ -319,6 +390,8 @@ pub struct DbIterator {
     last_key: Option<Bytes>,
     order: IterationOrder,
     read_span: tracing::Span,
+    cancellation_token: Option<CancellationToken>,
+    closed: bool,
 }
 
 impl DbIterator {
@@ -385,7 +458,14 @@ impl DbIterator {
             iter = Box::new(MergeOperatorRequiredIterator::new(iter));
         }
 
-        iter.init().instrument(read_span.clone()).await?;
+        if let Err(error) = iter.init().instrument(read_span.clone()).await {
+            let cleanup = iter.close().await;
+            return Err(if matches!(error, SlateDBError::Cancelled) {
+                cleanup.err().unwrap_or(error)
+            } else {
+                error
+            });
+        }
 
         Ok(DbIterator {
             range,
@@ -394,7 +474,66 @@ impl DbIterator {
             last_key: None,
             order,
             read_span,
+            cancellation_token: None,
+            closed: false,
         })
+    }
+
+    pub(crate) fn with_cancellation_token(mut self, token: Option<CancellationToken>) -> Self {
+        self.cancellation_token = token;
+        self
+    }
+
+    /// Returns this iterator's cancellation handle. It never cancels the caller's token.
+    pub fn cancellation_token(&self) -> Option<CancellationToken> {
+        self.cancellation_token.clone()
+    }
+
+    /// Cancel and join this iterator's original read work before releasing it.
+    /// Dropping a Rust iterator alone cannot perform this asynchronous join.
+    pub async fn close(&mut self) -> Result<(), crate::Error> {
+        self.close_inner().await.map_err(Into::into)
+    }
+
+    pub(crate) async fn close_inner(&mut self) -> Result<(), SlateDBError> {
+        if !self.closed {
+            if let Some(token) = &self.cancellation_token {
+                token.cancel();
+            }
+            let result = self.iter.close().await;
+            self.closed = true;
+            if let Err(error) = result {
+                if self.invalidated_error.is_none()
+                    || matches!(self.invalidated_error, Some(SlateDBError::Cancelled))
+                        && !matches!(error, SlateDBError::Cancelled)
+                {
+                    self.invalidated_error = Some(error);
+                }
+            }
+        }
+        self.invalidated_error.clone().map_or(Ok(()), Err)
+    }
+
+    async fn finish_result<T>(
+        &mut self,
+        result: Result<T, SlateDBError>,
+    ) -> Result<T, SlateDBError> {
+        let result = if result.is_ok()
+            && self
+                .cancellation_token
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+        {
+            Err(SlateDBError::Cancelled)
+        } else {
+            result
+        };
+        if let Err(error) = result {
+            self.invalidated_error = Some(error);
+            self.close_inner().await?;
+            unreachable!("close retains the original error")
+        }
+        result
     }
 
     /// Get the next key-value pair.
@@ -426,6 +565,14 @@ impl DbIterator {
     async fn next_entry_inner(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         if let Some(error) = self.invalidated_error.clone() {
             Err(error)
+        } else if self.closed {
+            Ok(None)
+        } else if self
+            .cancellation_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            self.finish_result(Err(SlateDBError::Cancelled)).await
         } else {
             let result = loop {
                 let next = self.iter.next().await;
@@ -440,22 +587,15 @@ impl DbIterator {
                     Err(e) => break Err(e),
                 }
             };
-            let result = self.maybe_invalidate(result);
+            let result = self.finish_result(result).await;
+            if matches!(result, Ok(None)) {
+                self.close_inner().await?;
+            }
             if let Ok(Some(ref entry)) = result {
                 self.last_key = Some(entry.key.clone());
             }
             result
         }
-    }
-
-    fn maybe_invalidate<T: Clone>(
-        &mut self,
-        result: Result<T, SlateDBError>,
-    ) -> Result<T, SlateDBError> {
-        if let Err(error) = &result {
-            self.invalidated_error = Some(error.clone());
-        }
-        result
     }
 
     /// Seek ahead to the next key. The next key must be larger than the
@@ -482,6 +622,15 @@ impl DbIterator {
         let next_key = next_key.as_ref();
         if let Some(error) = self.invalidated_error.clone() {
             Err(error.into())
+        } else if self
+            .cancellation_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+            && !self.closed
+        {
+            self.finish_result(Err(SlateDBError::Cancelled))
+                .await
+                .map_err(Into::into)
         } else if matches!(self.order, IterationOrder::Descending) {
             Err(SlateDBError::SeekNotSupportedForDescendingScan.into())
         } else if !self.range.contains(&next_key) {
@@ -496,9 +645,11 @@ impl DbIterator {
             .is_some_and(|last_key| next_key <= last_key)
         {
             Err(SlateDBError::SeekKeyLessThanLastReturnedKey.into())
+        } else if self.closed {
+            Ok(())
         } else {
             let result = self.iter.seek(next_key).await;
-            self.maybe_invalidate(result).map_err(Into::into)
+            self.finish_result(result).await.map_err(Into::into)
         }
     }
 }
@@ -640,6 +791,10 @@ mod tests {
 
     #[async_trait]
     impl RowEntryIterator for ProbeIterator {
+        async fn close(&mut self) -> Result<(), SlateDBError> {
+            Ok(())
+        }
+
         async fn init(&mut self) -> Result<(), SlateDBError> {
             self.record.initialized.lock().push(self.id);
             let in_flight = self.record.in_flight.fetch_add(1, Ordering::SeqCst) + 1;

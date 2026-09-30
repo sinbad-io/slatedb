@@ -206,6 +206,10 @@ impl<T: RowEntryIterator> MergeOperatorRequiredIterator<T> {
 
 #[async_trait]
 impl<T: RowEntryIterator> RowEntryIterator for MergeOperatorRequiredIterator<T> {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        self.delegate.close().await
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         self.delegate.init().await
     }
@@ -450,6 +454,10 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
 
 #[async_trait]
 impl<T: RowEntryIterator> RowEntryIterator for MergeOperatorIterator<T> {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        self.delegate.close().await
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         self.delegate.init().await
     }
@@ -822,6 +830,10 @@ mod tests {
 
     #[async_trait]
     impl RowEntryIterator for MockRowEntryIterator {
+        async fn close(&mut self) -> Result<(), SlateDBError> {
+            Ok(())
+        }
+
         async fn init(&mut self) -> Result<(), SlateDBError> {
             Ok(())
         }

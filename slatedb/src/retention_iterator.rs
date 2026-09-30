@@ -207,6 +207,10 @@ impl<T: RowEntryIterator> RetentionIterator<T> {
 
 #[async_trait]
 impl<T: RowEntryIterator> RowEntryIterator for RetentionIterator<T> {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        self.inner.close().await
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         self.inner.init().await?;
         Ok(())

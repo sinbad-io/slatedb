@@ -370,6 +370,9 @@ impl ReadOptions {
 }
 #[derive(Clone, Debug)]
 pub struct ScanOptions {
+    /// Optional cancellation for this scan. A scan owns a child token;
+    /// closing it does not cancel the caller or another scan.
+    pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
     /// Specifies the minimum durability level for data returned by this scan. For example,
     /// if set to Remote then slatedb returns the latest version of a row that has been durably
     /// stored in object storage.
@@ -404,6 +407,7 @@ impl Default for ScanOptions {
     /// Create a new ScanOptions with `read_level` set to [`DurabilityLevel::Memory`].
     fn default() -> Self {
         Self {
+            cancellation_token: None,
             durability_filter: DurabilityLevel::default(),
             dirty: false,
             read_ahead_bytes: 1,
@@ -419,6 +423,16 @@ impl Default for ScanOptions {
 impl ScanOptions {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_cancellation_token(
+        self,
+        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    ) -> Self {
+        Self {
+            cancellation_token,
+            ..self
+        }
     }
 
     pub fn with_dirty(self, dirty: bool) -> Self {

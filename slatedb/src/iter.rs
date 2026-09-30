@@ -16,6 +16,10 @@ pub enum IterationOrder {
 
 #[async_trait]
 pub(crate) trait RowEntryIterator: Send + Sync {
+    /// Stops new work and joins work already owned by this iterator.
+    /// Callers must await this before discarding an initialized iterator.
+    async fn close(&mut self) -> Result<(), SlateDBError>;
+
     /// Performs any expensive initialization required before regular iteration.
     ///
     /// This method should be idempotent and can be called multiple times, only
@@ -59,6 +63,10 @@ pub(crate) trait TrackedRowEntryIterator: RowEntryIterator {
 
 #[async_trait]
 impl<'a> RowEntryIterator for Box<dyn RowEntryIterator + 'a> {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        self.as_mut().close().await
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         self.as_mut().init().await
     }
@@ -74,6 +82,10 @@ impl<'a> RowEntryIterator for Box<dyn RowEntryIterator + 'a> {
 
 #[async_trait]
 impl<'a> RowEntryIterator for Box<dyn TrackedRowEntryIterator + 'a> {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        self.as_mut().close().await
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         self.as_mut().init().await
     }
@@ -103,6 +115,10 @@ impl EmptyIterator {
 
 #[async_trait]
 impl RowEntryIterator for EmptyIterator {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        Ok(())
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         Ok(())
     }

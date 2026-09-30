@@ -42,6 +42,10 @@ impl<T: RowEntryIterator> PeekingIterator<T> {
 
 #[async_trait]
 impl<T: RowEntryIterator> RowEntryIterator for PeekingIterator<T> {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        self.iterator.close().await
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         self.iterator.init().await
     }

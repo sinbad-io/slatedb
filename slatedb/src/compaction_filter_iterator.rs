@@ -43,6 +43,10 @@ impl<T: RowEntryIterator> CompactionFilterIterator<T> {
 
 #[async_trait]
 impl<T: RowEntryIterator> RowEntryIterator for CompactionFilterIterator<T> {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        self.inner.close().await
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         self.inner.init().await
     }
@@ -98,6 +102,10 @@ mod tests {
 
     #[async_trait]
     impl RowEntryIterator for MockIterator {
+        async fn close(&mut self) -> Result<(), SlateDBError> {
+            Ok(())
+        }
+
         async fn init(&mut self) -> Result<(), SlateDBError> {
             Ok(())
         }

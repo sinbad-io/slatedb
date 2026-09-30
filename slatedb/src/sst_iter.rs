@@ -850,6 +850,15 @@ impl<'a> InternalSstIterator<'a> {
 
 #[async_trait]
 impl RowEntryIterator for InternalSstIterator<'_> {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        let result = self.stop().await;
+        if let Some(buffer) = &mut self.descending_buffer {
+            buffer.clear();
+        }
+        self.pending_entry = None;
+        result
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         if !self.state.is_initialized() {
             self.advance_block().await?;
@@ -858,6 +867,15 @@ impl RowEntryIterator for InternalSstIterator<'_> {
     }
 
     async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        if self
+            .options
+            .cancellation_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            self.close().await?;
+            return Err(SlateDBError::Cancelled);
+        }
         if !self.state.is_initialized() {
             return Err(SlateDBError::IteratorNotInitialized);
         }
@@ -903,6 +921,15 @@ impl RowEntryIterator for InternalSstIterator<'_> {
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
+        if self
+            .options
+            .cancellation_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            self.close().await?;
+            return Err(SlateDBError::Cancelled);
+        }
         if !self.state.is_initialized() {
             return Err(SlateDBError::IteratorNotInitialized);
         }
@@ -1041,6 +1068,11 @@ impl<'a> FilterIterator<'a> {
 
 #[async_trait]
 impl RowEntryIterator for FilterIterator<'_> {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        self.initialized = true;
+        self.inner.close().await
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         if !self.initialized {
             let filters = self.read_filters().await?;
@@ -1210,16 +1242,11 @@ impl<'a> SstIterator<'a> {
         match internal {
             Some(inner) => {
                 let mut iterator = Self::from_internal(inner, db_stats);
-                match &mut iterator.delegate {
-                    SstIteratorDelegate::Filter(filter_iter) => {
-                        filter_iter.init().await?;
-                        if filter_iter.is_filtered_out() {
-                            return Ok(None);
-                        }
-                    }
-                    SstIteratorDelegate::Direct(inner_iter) => {
-                        inner_iter.init().await?;
-                    }
+                iterator.init().await?;
+                if matches!(&iterator.delegate, SstIteratorDelegate::Filter(filter) if filter.is_filtered_out())
+                {
+                    iterator.close().await?;
+                    return Ok(None);
                 }
                 Ok(Some(iterator))
             }
@@ -1259,16 +1286,11 @@ impl<'a> SstIterator<'a> {
         match internal {
             Some(inner) => {
                 let mut iterator = Self::from_internal(inner, None);
-                match &mut iterator.delegate {
-                    SstIteratorDelegate::Filter(filter_iter) => {
-                        filter_iter.init().await?;
-                        if filter_iter.is_filtered_out() {
-                            return Ok(None);
-                        }
-                    }
-                    SstIteratorDelegate::Direct(inner_iter) => {
-                        inner_iter.init().await?;
-                    }
+                iterator.init().await?;
+                if matches!(&iterator.delegate, SstIteratorDelegate::Filter(filter) if filter.is_filtered_out())
+                {
+                    iterator.close().await?;
+                    return Ok(None);
                 }
                 Ok(Some(iterator))
             }
@@ -1300,16 +1322,11 @@ impl<'a> SstIterator<'a> {
         match internal {
             Some(inner) => {
                 let mut iterator = Self::from_internal(inner, db_stats);
-                match &mut iterator.delegate {
-                    SstIteratorDelegate::Filter(filter_iter) => {
-                        filter_iter.init().await?;
-                        if filter_iter.is_filtered_out() {
-                            return Ok(None);
-                        }
-                    }
-                    SstIteratorDelegate::Direct(inner_iter) => {
-                        inner_iter.init().await?;
-                    }
+                iterator.init().await?;
+                if matches!(&iterator.delegate, SstIteratorDelegate::Filter(filter) if filter.is_filtered_out())
+                {
+                    iterator.close().await?;
+                    return Ok(None);
                 }
                 Ok(Some(iterator))
             }
@@ -1320,11 +1337,25 @@ impl<'a> SstIterator<'a> {
 
 #[async_trait]
 impl RowEntryIterator for SstIterator<'_> {
-    async fn init(&mut self) -> Result<(), SlateDBError> {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
         match &mut self.delegate {
+            SstIteratorDelegate::Direct(inner) => inner.close().await,
+            SstIteratorDelegate::Filter(inner) => inner.close().await,
+        }
+    }
+
+    async fn init(&mut self) -> Result<(), SlateDBError> {
+        let result = match &mut self.delegate {
             SstIteratorDelegate::Direct(inner) => inner.init().await,
             SstIteratorDelegate::Filter(inner) => inner.init().await,
+        };
+        if result.is_err() {
+            let cleanup = self.close().await;
+            if matches!(result, Err(SlateDBError::Cancelled)) && cleanup.is_err() {
+                return cleanup;
+            }
         }
+        result
     }
 
     async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
@@ -4432,6 +4463,10 @@ mod tests {
 
     #[async_trait]
     impl RowEntryIterator for ScanInitError {
+        async fn close(&mut self) -> Result<(), SlateDBError> {
+            Ok(())
+        }
+
         async fn init(&mut self) -> Result<(), SlateDBError> {
             Err(SlateDBError::IoError(Arc::new(std::io::Error::other(
                 "scan child initialization failed",
@@ -4485,5 +4520,89 @@ mod tests {
             !parent.is_cancelled(),
             "closing a child canceled its caller"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_close_joins_original_prefetch_and_keeps_sibling_readable() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (mut iter, cache, parent, originals) = held_scan_prefetch().await;
+        let inner = match &iter.delegate {
+            SstIteratorDelegate::Direct(inner) => inner,
+            SstIteratorDelegate::Filter(filtered) => &filtered.inner,
+        };
+        let mut sibling = SstIterator::new_owned_initialized(
+            Bytes::from_static(b"k029")..=Bytes::from_static(b"k029"),
+            inner.view.table_as_ref().clone(),
+            inner.table_store.clone(),
+            SstIteratorOptions {
+                cancellation_token: Some(parent.clone()),
+                ..SstIteratorOptions::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut close = Box::pin(iter.close());
+        let first = futures::poll!(close.as_mut());
+        let returned_early = first.is_ready();
+        let dropped_early = cache.dropped.load(SeqCst);
+        cache.release();
+        let result = match first {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => {
+                tokio::time::timeout(std::time::Duration::from_secs(2), close.as_mut())
+                    .await
+                    .unwrap()
+            }
+        };
+        drop(close);
+        settle_scan_fixture_tasks(&originals).await;
+        result.unwrap();
+        let row = sibling.next().await.unwrap().unwrap();
+        let end = sibling.next().await.unwrap();
+        sibling.close().await.unwrap();
+        iter.close().await.unwrap();
+        assert!(iter.next().await.unwrap().is_none());
+        assert_eq!(row.key.as_ref(), b"k029");
+        assert!(end.is_none());
+        assert!(
+            !returned_early,
+            "Close returned before original prefetch joined"
+        );
+        assert_eq!(dropped_early, 0);
+        assert_eq!(cache.started.load(SeqCst), 1);
+        assert_eq!(cache.dropped.load(SeqCst), 1);
+        assert!(!parent.is_cancelled(), "Close canceled a sibling's caller");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_cancelled_next_joins_prefetch_before_refusing_cached_row() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (mut iter, cache, parent, originals) = held_scan_prefetch().await;
+        parent.cancel();
+        let mut next = Box::pin(iter.next());
+        let first = futures::poll!(next.as_mut());
+        let returned_early = first.is_ready();
+        let dropped_early = cache.dropped.load(SeqCst);
+        cache.release();
+        let result = match first {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => {
+                tokio::time::timeout(std::time::Duration::from_secs(2), next.as_mut())
+                    .await
+                    .unwrap()
+            }
+        };
+        drop(next);
+        settle_scan_fixture_tasks(&originals).await;
+        iter.close().await.unwrap();
+        assert!(matches!(result, Err(SlateDBError::Cancelled)));
+        assert!(
+            !returned_early,
+            "cancellation returned before original prefetch joined"
+        );
+        assert_eq!(dropped_early, 0);
+        assert_eq!(cache.started.load(SeqCst), 1);
+        assert_eq!(cache.dropped.load(SeqCst), 1);
     }
 }

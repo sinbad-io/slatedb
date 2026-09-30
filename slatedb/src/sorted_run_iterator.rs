@@ -260,6 +260,18 @@ impl<'a> SortedRunIterator<'a> {
     }
 
     async fn advance_table(&mut self) -> Result<(), SlateDBError> {
+        if let Some(current) = &mut self.current_iter {
+            current.close().await?;
+        }
+        self.current_iter = None;
+        if self
+            .sst_iter_options
+            .cancellation_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(SlateDBError::Cancelled);
+        }
         self.current_iter = self
             .view
             .build_next_iter(
@@ -386,10 +398,30 @@ impl<'a> SortedRunIterator<'a> {
 
 #[async_trait]
 impl RowEntryIterator for SortedRunIterator<'_> {
+    async fn close(&mut self) -> Result<(), SlateDBError> {
+        let result = match &mut self.current_iter {
+            Some(current) => current.close().await,
+            None => Ok(()),
+        };
+        self.current_iter = None;
+        match &mut self.view {
+            SortedRunView::Owned(tables, _) => tables.clear(),
+            SortedRunView::Borrowed(tables, _) => tables.clear(),
+        }
+        if let Some(state) = &mut self.descending_state {
+            *state = DescendingIteratorState::default();
+        }
+        self.initialized = true;
+        result
+    }
+
     async fn init(&mut self) -> Result<(), SlateDBError> {
         if !self.initialized {
             if let Some(iter) = self.current_iter.as_mut() {
-                iter.init().await?;
+                if let Err(error) = iter.init().await {
+                    let _ = self.close().await;
+                    return Err(error);
+                }
             }
             self.initialized = true;
         }
