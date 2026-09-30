@@ -38,6 +38,8 @@ enum FetchTask {
 pub(crate) struct SstIteratorOptions {
     /// Only point-read callers opt in; even exact-key scans keep task prefetch.
     pub(crate) inline_point_read: bool,
+    /// Cancellable point reads keep cache misses in their original future.
+    pub(crate) cancellation_token: Option<tokio_util::sync::CancellationToken>,
     pub(crate) max_fetch_tasks: usize,
     pub(crate) target_bytes_to_fetch: usize,
     pub(crate) cache_blocks: bool,
@@ -53,6 +55,7 @@ impl Default for SstIteratorOptions {
     fn default() -> Self {
         SstIteratorOptions {
             inline_point_read: false,
+            cancellation_token: None,
             max_fetch_tasks: 1,
             target_bytes_to_fetch: 1,
             cache_blocks: true,
@@ -487,12 +490,20 @@ impl<'a> InternalSstIterator<'a> {
                     let table_store = self.table_store.clone();
                     let index = index.clone();
                     let cache_blocks = self.options.cache_blocks;
+                    let cancellation_token = self.options.cancellation_token.clone();
                     let segment = self.options.segment.clone();
                     let blocks_end = blocks.end;
                     let single_block = blocks.len() == 1 && self.options.target_bytes_to_fetch == 1;
                     let read = async move {
                         table_store
-                            .read_blocks_using_index(&table, index, blocks, cache_blocks, segment)
+                            .read_blocks_with_ownership(
+                                &table,
+                                index,
+                                blocks,
+                                cache_blocks,
+                                segment,
+                                cancellation_token.as_ref(),
+                            )
                             .await
                     };
                     let fetch = if self.options.inline_point_read
@@ -525,17 +536,19 @@ impl<'a> InternalSstIterator<'a> {
                     let table_store = self.table_store.clone();
                     let index = index.clone();
                     let cache_blocks = self.options.cache_blocks;
+                    let cancellation_token = self.options.cancellation_token.clone();
                     let segment = self.options.segment.clone();
                     let blocks_start = blocks.start;
                     self.fetch_tasks
                         .push_back(FetchTask::InFlight(tokio::spawn(async move {
                             table_store
-                                .read_blocks_using_index(
+                                .read_blocks_with_ownership(
                                     &table,
                                     index,
                                     blocks,
                                     cache_blocks,
                                     segment,
+                                    cancellation_token.as_ref(),
                                 )
                                 .await
                         })));
@@ -666,12 +679,13 @@ impl<'a> InternalSstIterator<'a> {
             let read_trace = self.read_trace();
             let index = self
                 .table_store
-                .read_index(
+                .read_index_with_ownership(
                     &self.view.table_as_ref().sst,
                     self.options.cache_metadata,
                     self.options.segment.clone(),
                     &read_trace,
                     self.sst_level(),
+                    self.options.cancellation_token.as_ref(),
                 )
                 .await?;
             let block_idx_range = partitioned_keyspace::partitions_covering_range(
@@ -914,12 +928,13 @@ impl<'a> FilterIterator<'a> {
         let read_trace = self.inner.read_trace();
         self.inner
             .table_store()
-            .read_filters(
+            .read_filters_with_ownership(
                 &self.inner.view().table_as_ref().sst,
                 self.inner.options.cache_metadata,
                 self.inner.options.segment.clone(),
                 &read_trace,
                 self.inner.sst_level(),
+                self.inner.options.cancellation_token.as_ref(),
             )
             .await
     }
@@ -2118,6 +2133,7 @@ mod tests {
             table_store.clone(),
             SstIteratorOptions {
                 inline_point_read: false,
+                cancellation_token: None,
                 max_fetch_tasks: 32,
                 target_bytes_to_fetch: 256 * 128,
                 cache_blocks: true,
@@ -2139,6 +2155,7 @@ mod tests {
             table_store.clone(),
             SstIteratorOptions {
                 inline_point_read: false,
+                cancellation_token: None,
                 max_fetch_tasks: 1,
                 target_bytes_to_fetch: 1,
                 cache_blocks: true,
@@ -2775,6 +2792,7 @@ mod tests {
 
         let sst_iter_options = SstIteratorOptions {
             inline_point_read: false,
+            cancellation_token: None,
             max_fetch_tasks: 3,
             target_bytes_to_fetch: 3 * 128,
             cache_blocks: true,
@@ -3082,6 +3100,7 @@ mod tests {
             table_store.clone(),
             SstIteratorOptions {
                 inline_point_read: false,
+                cancellation_token: None,
                 max_fetch_tasks: 1,
                 target_bytes_to_fetch: 1,
                 cache_blocks: true,

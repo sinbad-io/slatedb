@@ -42,3 +42,13 @@ The error controls cancel the token in the same object-store poll that returns a
 The cache controls hold the return from a real Foyer lookup in one retained fixture task. They model Foyer's detached lookup boundary, not a physical disk stall. Cancellation cannot return while that task remains held. After release, the read must return cancellation and the same original snapshot must still work. Every original fixture task joins before assertions. A local disk lookup can delay cancellation until it returns. These controls do not bound that latency.
 
 The API-only source also sets the new token field to None in two existing full literals. One is the legacy UniFFI conversion. The other is a native unit-test literal. Neither change adds a cancellation handler or a wire API.
+
+## Prepared point-read source
+
+The candidate remains unbuilt. It adds a token only to the existing point-read configuration. The original Reader call stays alive until its cache lookups return. Filter, index, and data cache misses use the same token inside their original object futures. Cancellation drops those owned futures before return. An error from the original storage poll takes precedence over concurrent cancellation.
+
+Foyer 0.22.6 `HybridCache.get` calls `memory.get_or_fetch_inner` with a storage spawner in `foyer/src/hybrid/cache.rs:678–720`. Thus even a disk cache hit can own a task outside the waiting future. The candidate does not select cancellation around that whole cache future. It awaits the cache call, then checks the token. No dependency code, cache map, retry policy, or scan ownership changes.
+
+Token reads keep memory and disk cache hits. On a cold miss, each caller loads its own bytes and inserts a valid result through the existing cache. Legacy reads keep the shared-loader path. Read-owned inserts can still feed the cache's existing background flush. The cache owner retains that existing lifetime. The point-read change does not claim to join all cache maintenance.
+
+The prepared source does not add a Go token callback or a new UniFFI method. No library, generated binding, or installed artifact changed. Actual held behavior, deliberate omissions, complete affected tests, source publication, and a separate shared roll still remain.

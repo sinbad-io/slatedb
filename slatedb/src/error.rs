@@ -16,6 +16,9 @@ use slatedb_txn_obj::TransactionalObjectError;
 #[non_exhaustive]
 #[derive(Clone, Debug, ThisError)]
 pub(crate) enum SlateDBError {
+    #[error("read cancelled")]
+    Cancelled,
+
     #[error("io error")]
     IoError(#[from] Arc<std::io::Error>),
 
@@ -635,6 +638,11 @@ impl From<SlateDBError> for Error {
     fn from(err: SlateDBError) -> Self {
         let msg = err.to_string();
         match err {
+            SlateDBError::Cancelled => Error {
+                msg,
+                kind: ErrorKind::Cancelled,
+                source: None,
+            },
             // Transaction errors
             SlateDBError::TransactionConflict => Error::transaction(msg),
 

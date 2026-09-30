@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::future::Future;
 use std::ops::{Range, RangeBounds};
 use std::sync::Arc;
 
@@ -12,6 +13,7 @@ use object_store::{GetOptions, ObjectStore, ObjectStoreExt};
 use slatedb_common::object_metadata::IdentifiedObjectMetadata;
 use slatedb_common::ObjectMetadata;
 use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use crate::block_cache_policy::{should_cache_data_block, BlockCachePolicy};
@@ -57,6 +59,29 @@ fn record_read_cached(span: &tracing::Span, lookup: CacheLookup) {
         CacheLookup::Hit => span.record("cached", true),
         CacheLookup::Miss => span.record("cached", false),
     };
+}
+
+fn check_read_cancelled(token: Option<&CancellationToken>) -> Result<(), SlateDBError> {
+    if token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(SlateDBError::Cancelled);
+    }
+    Ok(())
+}
+
+async fn read_with_cancellation<T>(
+    token: Option<&CancellationToken>,
+    read: impl Future<Output = Result<T, SlateDBError>>,
+) -> Result<T, SlateDBError> {
+    let Some(token) = token else {
+        return read.await;
+    };
+    check_read_cancelled(Some(token))?;
+    // A storage error that this original poll observes takes precedence.
+    tokio::select! {
+        biased;
+        result = read => result,
+        _ = token.cancelled() => Err(SlateDBError::Cancelled),
+    }
 }
 
 impl TableStore {
@@ -403,6 +428,19 @@ impl TableStore {
         trace: &ReadTrace,
         sst_level: Option<&SstTraceLevel>,
     ) -> Result<Arc<[NamedFilter]>, SlateDBError> {
+        self.read_filters_with_ownership(handle, cache_blocks, segment, trace, sst_level, None)
+            .await
+    }
+
+    pub(crate) async fn read_filters_with_ownership(
+        &self,
+        handle: &SsTableHandle,
+        cache_blocks: bool,
+        segment: Option<Bytes>,
+        trace: &ReadTrace,
+        sst_level: Option<&SstTraceLevel>,
+        token: Option<&CancellationToken>,
+    ) -> Result<Arc<[NamedFilter]>, SlateDBError> {
         // No filter exists for this SST (either no policies configured, or the
         // SST was built below `min_filter_keys`). Return an empty slice without
         // touching the cache: there is nothing to load, and caching the empty
@@ -411,7 +449,7 @@ impl TableStore {
             return Ok(Arc::from([]));
         }
         let span = trace.new_read_filter_span(handle.id, sst_level);
-        let read = self.read_filters_inner(handle, cache_blocks, segment, span.clone());
+        let read = self.read_filters_inner(handle, cache_blocks, segment, span.clone(), token);
         read.instrument(span).await
     }
 
@@ -421,16 +459,15 @@ impl TableStore {
         cache_blocks: bool,
         segment: Option<Bytes>,
         span: tracing::Span,
+        token: Option<&CancellationToken>,
     ) -> Result<Arc<[NamedFilter]>, SlateDBError> {
+        check_read_cancelled(token)?;
         let cache_key: CachedKey = (handle.id, handle.info.filter_offset).into();
         if let Some(cache) = self.cache_for_reads() {
-            // cache_blocks=true: dedup-aware fetch; concurrent callers collapse onto
-            // one loader. cache_blocks=false: read-only lookup that won't pollute the
-            // cache on miss. Cache errors fall through to a best-effort direct load;
-            // we intentionally don't re-insert there — `fetch_X` errors are almost
-            // always the smuggled loader error (so the direct retry will also fail),
-            // and on the rare foyer-machinery error an insert would likely fail too.
-            let fetch = if cache_blocks {
+            // Token reads await cache lookup but own each object miss.
+            // Legacy reads still share one loader when cache_blocks is true.
+            // Cache errors retain the existing direct-load fallback.
+            let fetch = if cache_blocks && token.is_none() {
                 cache
                     .fetch_filter(
                         cache_key.clone(),
@@ -445,6 +482,7 @@ impl TableStore {
                     .unwrap_or(None)
                     .map(CacheFetch::hit)
             };
+            check_read_cancelled(token)?;
             if let Some(CacheFetch { entry, lookup }) = fetch {
                 // Already decoded.
                 if let Some(filters) = entry.filters() {
@@ -462,13 +500,24 @@ impl TableStore {
             }
         }
         record_read_cached(&span, CacheLookup::Miss);
-        read_obj!(
-            &self.object_store,
-            self.path(&handle.id),
-            ObjectStoreCallTag::new_with_segment(self.kind, SstType::from(&handle.id), segment),
-            |obj| self.sst_format.read_filters(&handle.info, &obj)
+        let filters = read_with_cancellation(
+            token,
+            read_obj!(
+                &self.object_store,
+                self.path(&handle.id),
+                ObjectStoreCallTag::new_with_segment(self.kind, SstType::from(&handle.id), segment),
+                |obj| self.sst_format.read_filters(&handle.info, &obj)
+            ),
         )
-        .await
+        .await?;
+        if token.is_some() && cache_blocks {
+            if let Some(cache) = self.cache_for_reads() {
+                cache
+                    .insert(cache_key, CachedEntry::with_filters(filters.clone()))
+                    .await;
+            }
+        }
+        Ok(filters)
     }
 
     /// Reads the stats block of an SSTable.
@@ -532,8 +581,21 @@ impl TableStore {
         trace: &ReadTrace,
         sst_level: Option<&SstTraceLevel>,
     ) -> Result<Arc<SsTableIndexOwned>, SlateDBError> {
+        self.read_index_with_ownership(handle, cache_blocks, segment, trace, sst_level, None)
+            .await
+    }
+
+    pub(crate) async fn read_index_with_ownership(
+        &self,
+        handle: &SsTableHandle,
+        cache_blocks: bool,
+        segment: Option<Bytes>,
+        trace: &ReadTrace,
+        sst_level: Option<&SstTraceLevel>,
+        token: Option<&CancellationToken>,
+    ) -> Result<Arc<SsTableIndexOwned>, SlateDBError> {
         let span = trace.new_read_index_span(handle.id, sst_level);
-        let read = self.read_index_inner(handle, cache_blocks, segment, span.clone());
+        let read = self.read_index_inner(handle, cache_blocks, segment, span.clone(), token);
         read.instrument(span).await
     }
 
@@ -543,14 +605,16 @@ impl TableStore {
         cache_blocks: bool,
         segment: Option<Bytes>,
         span: tracing::Span,
+        token: Option<&CancellationToken>,
     ) -> Result<Arc<SsTableIndexOwned>, SlateDBError> {
-        let cache_key = (handle.id, handle.info.index_offset).into();
+        check_read_cancelled(token)?;
+        let cache_key: CachedKey = (handle.id, handle.info.index_offset).into();
         if let Some(cache) = self.cache_for_reads() {
             // See `read_filters` for the rationale on the fall-through path.
-            let fetch = if cache_blocks {
+            let fetch = if cache_blocks && token.is_none() {
                 cache
                     .fetch_index(
-                        cache_key,
+                        cache_key.clone(),
                         self.read_loader(handle, CacheTarget::Index, segment.clone()),
                     )
                     .await
@@ -562,6 +626,7 @@ impl TableStore {
                     .unwrap_or(None)
                     .map(CacheFetch::hit)
             };
+            check_read_cancelled(token)?;
             if let Some(CacheFetch { entry, lookup }) = fetch {
                 if let Some(index) = entry.sst_index() {
                     record_read_cached(&span, lookup);
@@ -570,14 +635,25 @@ impl TableStore {
             }
         }
         record_read_cached(&span, CacheLookup::Miss);
-        let index = read_obj!(
-            &self.object_store,
-            self.path(&handle.id),
-            ObjectStoreCallTag::new_with_segment(self.kind, SstType::from(&handle.id), segment),
-            |obj| self.sst_format.read_index(&handle.info, &obj)
+        let index = read_with_cancellation(
+            token,
+            read_obj!(
+                &self.object_store,
+                self.path(&handle.id),
+                ObjectStoreCallTag::new_with_segment(self.kind, SstType::from(&handle.id), segment),
+                |obj| self.sst_format.read_index(&handle.info, &obj)
+            ),
         )
         .await?;
-        Ok(Arc::new(index))
+        let index = Arc::new(index);
+        if token.is_some() && cache_blocks {
+            if let Some(cache) = self.cache_for_reads() {
+                cache
+                    .insert(cache_key, CachedEntry::with_sst_index(index.clone()))
+                    .await;
+            }
+        }
+        Ok(index)
     }
 
     /// Build a [`CacheLoader`] for a section-level cache entry (filter, stats,
@@ -782,13 +858,27 @@ impl TableStore {
         cache_blocks: bool,
         segment: Option<Bytes>,
     ) -> Result<VecDeque<Arc<Block>>, SlateDBError> {
+        self.read_blocks_with_ownership(handle, index, blocks, cache_blocks, segment, None)
+            .await
+    }
+
+    pub(crate) async fn read_blocks_with_ownership(
+        &self,
+        handle: &SsTableHandle,
+        index: Arc<SsTableIndexOwned>,
+        blocks: Range<usize>,
+        cache_blocks: bool,
+        segment: Option<Bytes>,
+        token: Option<&CancellationToken>,
+    ) -> Result<VecDeque<Arc<Block>>, SlateDBError> {
+        check_read_cancelled(token)?;
         // Single-block reads (point-gets via SstIterator::for_key, SstFile::read_block,
         // etc.) take a dedup-aware fast-path: concurrent callers for the same block
         // collapse onto one loader. Multi-block reads fall through to the range-
         // coalesced path below, which issues one object-store GET per contiguous
         // run of uncached blocks. Cache errors fall through to the direct load,
         // which produces the authoritative error if any.
-        if cache_blocks && blocks.len() == 1 {
+        if cache_blocks && token.is_none() && blocks.len() == 1 {
             if let Some(cache) = self.cache_for_reads() {
                 let block_num = blocks.start;
                 let offset = index.borrow().block_meta().get(block_num).offset();
@@ -824,6 +914,7 @@ impl TableStore {
                     .and_then(|entry| entry.block())
             }))
             .await;
+            check_read_cancelled(token)?;
 
             let mut last_uncached_start = None;
 
@@ -858,25 +949,28 @@ impl TableStore {
             let index_ref = &index;
             let segment = segment.clone();
             async move {
-                read_with_validation_retry(
-                    ObjectStoreCallTag::new_with_segment(
-                        self.kind,
-                        SstType::from(&handle.id),
-                        segment,
+                read_with_cancellation(
+                    token,
+                    read_with_validation_retry(
+                        ObjectStoreCallTag::new_with_segment(
+                            self.kind,
+                            SstType::from(&handle.id),
+                            segment,
+                        ),
+                        |tag| {
+                            let obj = ReadOnlyObject {
+                                object_store: object_store.clone(),
+                                path: path.clone(),
+                                tag,
+                            };
+                            async move {
+                                self.sst_format
+                                    .read_blocks(&handle.info, index_ref, range.clone(), &obj)
+                                    .await
+                                    .map_err(|e| e.with_path(&obj.path))
+                            }
+                        },
                     ),
-                    |tag| {
-                        let obj = ReadOnlyObject {
-                            object_store: object_store.clone(),
-                            path: path.clone(),
-                            tag,
-                        };
-                        async move {
-                            self.sst_format
-                                .read_blocks(&handle.info, index_ref, range.clone(), &obj)
-                                .await
-                                .map_err(|e| e.with_path(&obj.path))
-                        }
-                    },
                 )
                 .await
             }

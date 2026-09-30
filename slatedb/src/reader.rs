@@ -359,7 +359,20 @@ impl Reader {
             max_seq,
             read_trace.clone(),
         );
-        read.instrument(read_trace.read_span()).await
+        let read = read.instrument(read_trace.read_span());
+        let Some(token) = options.cancellation_token.as_ref() else {
+            return read.await;
+        };
+        if token.is_cancelled() {
+            return Err(SlateDBError::Cancelled);
+        }
+        // Cache lookups must finish before this original call returns.
+        // Each object miss observes the token inside its owned future.
+        let result = read.await;
+        if result.is_ok() && token.is_cancelled() {
+            return Err(SlateDBError::Cancelled);
+        }
+        result
     }
 
     async fn get_key_value_with_options_inner<K: AsRef<[u8]>>(
@@ -378,6 +391,7 @@ impl Reader {
 
         let sst_iter_options = SstIteratorOptions {
             inline_point_read: true,
+            cancellation_token: options.cancellation_token.clone(),
             cache_blocks: options.cache_blocks,
             eager_spawn: true,
             filter_context: options.filter_context.clone(),
@@ -461,6 +475,7 @@ impl Reader {
 
         let sst_iter_options = SstIteratorOptions {
             inline_point_read: false,
+            cancellation_token: None,
             max_fetch_tasks: options.max_fetch_tasks,
             target_bytes_to_fetch: options.read_ahead_bytes,
             cache_blocks: options.cache_blocks,
@@ -546,6 +561,7 @@ impl Reader {
         let range = BytesRange::from_prefix(prefix.as_ref());
         let sst_iter_options = SstIteratorOptions {
             inline_point_read: false,
+            cancellation_token: None,
             max_fetch_tasks: options.max_fetch_tasks,
             target_bytes_to_fetch: options.read_ahead_bytes,
             cache_blocks: options.cache_blocks,
