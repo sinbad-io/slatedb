@@ -152,4 +152,75 @@ mod tests {
             .expect("next_batch(1000) after exhaustion failed")
             .is_empty());
     }
+
+    // New-API source controls: Close/ScanOptions token are not present in the
+    // published point binding. These are separate from old-API Go behavior.
+    #[tokio::test]
+    async fn scan_close_cancels_original_before_waiting_for_iterator_mutex() {
+        let db = seeded_db().await;
+        let parent = crate::cancellation::CancellationToken::new();
+        let options: slatedb::config::ScanOptions = crate::config::ScanOptions {
+            cancellation_token: Some(parent.clone()),
+            ..Default::default()
+        }
+        .try_into()
+        .unwrap();
+        let inner = db.scan_with_options(.., &options).await.unwrap();
+        let original = inner
+            .cancellation_token()
+            .expect("scan must retain its own child");
+        let iter = DbIterator::new(inner);
+        let held = iter.inner.lock().await;
+        let mut close = Box::pin(iter.close());
+        let pending = futures::poll!(close.as_mut()).is_pending();
+        let signaled = original.is_cancelled();
+        let parent_cancelled = parent.is_cancelled();
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(2), close)
+            .await
+            .unwrap()
+            .unwrap();
+        iter.close().await.unwrap();
+        assert!(pending, "Close did not retain the original locked iterator");
+        assert!(
+            signaled,
+            "Close waited for the mutex before cancelling original work"
+        );
+        assert!(!parent_cancelled, "Close cancelled caller or sibling scope");
+        let sibling = db.scan_with_options(.., &options).await.unwrap();
+        let sibling = DbIterator::new(sibling);
+        assert_eq!(sibling.next_batch(100).await.unwrap().len(), ROWS as usize);
+        sibling.close().await.unwrap();
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scan_close_retains_original_read_error_on_every_call() {
+        let db = seeded_db().await;
+        let parent = crate::cancellation::CancellationToken::new();
+        let options: slatedb::config::ScanOptions = crate::config::ScanOptions {
+            cancellation_token: Some(parent.clone()),
+            ..Default::default()
+        }
+        .try_into()
+        .unwrap();
+        let iter = DbIterator::new(db.scan_with_options(.., &options).await.unwrap());
+        parent.cancel();
+        let read = iter.next_batch(3).await;
+        let first = iter.close().await;
+        let second = iter.close().await;
+        assert!(
+            matches!(read, Err(crate::error::Error::Cancelled { .. })),
+            "{read:?}"
+        );
+        assert!(
+            matches!(first, Err(crate::error::Error::Cancelled { .. })),
+            "{first:?}"
+        );
+        assert!(
+            matches!(second, Err(crate::error::Error::Cancelled { .. })),
+            "{second:?}"
+        );
+        db.close().await.unwrap();
+    }
 }
