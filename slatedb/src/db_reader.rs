@@ -893,16 +893,19 @@ pub struct DbReaderSnapshot {
 
 impl DbReaderSnapshot {
     pub async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<Bytes>, crate::Error> {
+        self.get_with_options(key, &ReadOptions::default()).await
+    }
+
+    /// Reads from this same snapshot with the caller's read options.
+    pub async fn get_with_options<K: AsRef<[u8]> + Send>(
+        &self,
+        key: K,
+        options: &ReadOptions,
+    ) -> Result<Option<Bytes>, crate::Error> {
         self.inner.check_closed()?;
         self.inner
             .reader
-            .get_key_value_with_options(
-                key,
-                &ReadOptions::default(),
-                self.state.as_ref(),
-                None,
-                None,
-            )
+            .get_key_value_with_options(key, options, self.state.as_ref(), None, None)
             .await
             .map(|row| row.map(|row| row.value))
             .map_err(Into::into)

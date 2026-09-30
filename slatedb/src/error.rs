@@ -449,6 +449,9 @@ pub enum CloseReason {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
+    /// The caller stopped this operation. The database remains usable.
+    Cancelled,
+
     /// A transaction conflict occurred. The transaction must be retried or dropped.
     Transaction,
 
@@ -499,6 +502,7 @@ impl From<ErrorKind> for CloseReason {
 impl std::fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ErrorKind::Cancelled => write!(f, "Cancelled error"),
             ErrorKind::Transaction => write!(f, "Transaction error"),
             ErrorKind::Closed(_) => write!(f, "Closed error"),
             ErrorKind::Unavailable => write!(f, "Unavailable error"),

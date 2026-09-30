@@ -314,6 +314,8 @@ pub struct ReadOptions {
     pub filter_context: Option<FilterContext>,
     /// Optional caller-provided tracing settings.
     pub tracing_options: Option<TracingOptions>,
+    /// Stops this point read without closing the database or snapshot.
+    pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl Default for ReadOptions {
@@ -324,6 +326,7 @@ impl Default for ReadOptions {
             cache_blocks: true,
             filter_context: None,
             tracing_options: None,
+            cancellation_token: None,
         }
     }
 }
