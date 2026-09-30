@@ -3905,4 +3905,249 @@ mod tests {
         assert_eq!(cache.dropped.load(SeqCst), 1);
         assert!(iter.next().await.unwrap().is_none());
     }
+
+    struct ScanReadCache {
+        inner: TestCache,
+        offset: std::sync::atomic::AtomicU64,
+        started: std::sync::atomic::AtomicUsize,
+        dropped: Arc<std::sync::atomic::AtomicUsize>,
+        released: std::sync::atomic::AtomicBool,
+        changed: tokio::sync::Notify,
+    }
+
+    impl ScanReadCache {
+        fn release(&self) {
+            self.released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.changed.notify_waiters();
+        }
+
+        async fn wait_started(&self) {
+            loop {
+                let changed = self.changed.notified();
+                if self.started.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    return;
+                }
+                changed.await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DbCache for ScanReadCache {
+        async fn get_block(
+            &self,
+            key: &crate::db_cache::CachedKey,
+        ) -> Result<Option<crate::db_cache::CachedEntry>, crate::Error> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if key.block_id == self.offset.load(SeqCst) && !self.released.load(SeqCst) {
+                let _original = PointReadDrop(self.dropped.clone());
+                self.started.fetch_add(1, SeqCst);
+                self.changed.notify_waiters();
+                loop {
+                    let changed = self.changed.notified();
+                    if self.released.load(SeqCst) {
+                        break;
+                    }
+                    changed.await;
+                }
+            }
+            self.inner.get_block(key).await
+        }
+        async fn get_index(
+            &self,
+            key: &crate::db_cache::CachedKey,
+        ) -> Result<Option<crate::db_cache::CachedEntry>, crate::Error> {
+            self.inner.get_index(key).await
+        }
+        async fn get_filter(
+            &self,
+            key: &crate::db_cache::CachedKey,
+        ) -> Result<Option<crate::db_cache::CachedEntry>, crate::Error> {
+            self.inner.get_filter(key).await
+        }
+        async fn get_stats(
+            &self,
+            key: &crate::db_cache::CachedKey,
+        ) -> Result<Option<crate::db_cache::CachedEntry>, crate::Error> {
+            self.inner.get_stats(key).await
+        }
+        async fn insert(
+            &self,
+            key: crate::db_cache::CachedKey,
+            value: crate::db_cache::CachedEntry,
+        ) {
+            self.inner.insert(key, value).await;
+        }
+        async fn remove(&self, key: &crate::db_cache::CachedKey) {
+            self.inner.remove(key).await;
+        }
+        fn entry_count(&self) -> u64 {
+            self.inner.entry_count()
+        }
+    }
+
+    async fn held_scan_prefetch() -> (
+        SstIterator<'static>,
+        Arc<ScanReadCache>,
+        tokio_util::sync::CancellationToken,
+        Vec<tokio::task::AbortHandle>,
+    ) {
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
+        let cache = Arc::new(ScanReadCache {
+            inner: TestCache::new(),
+            offset: AtomicU64::new(u64::MAX),
+            started: AtomicUsize::new(0),
+            dropped: Arc::new(AtomicUsize::new(0)),
+            released: AtomicBool::new(false),
+            changed: tokio::sync::Notify::new(),
+        });
+        let table_store = Arc::new(TableStore::new(
+            Arc::new(InMemory::new()),
+            SsTableFormat {
+                block_size: 128,
+                ..SsTableFormat::default()
+            },
+            Path::from("scan-original-prefetch"),
+            Some(cache.clone()),
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        ));
+        let mut writer = table_store.table_writer(test_sst_id(0), Some(Bytes::new()));
+        for n in 0..30 {
+            writer
+                .add(RowEntry::new_value(
+                    format!("k{n:03}").as_bytes(),
+                    &[1; 128],
+                    1,
+                ))
+                .await
+                .unwrap();
+        }
+        let (table, _) = writer.close().await.unwrap();
+        let index = table_store
+            .read_index(
+                &table,
+                true,
+                Some(Bytes::new()),
+                &ReadTrace::new(None),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            index.borrow().block_meta().len() >= 4,
+            "fixture needs distinct prefetch and replacement blocks"
+        );
+        cache
+            .offset
+            .store(index.borrow().block_meta().get(1).offset(), SeqCst);
+        let parent = tokio_util::sync::CancellationToken::new();
+        let iter = SstIterator::new_owned_initialized(
+            ..,
+            SsTableView::identity(table),
+            table_store,
+            SstIteratorOptions {
+                max_fetch_tasks: 2,
+                cancellation_token: Some(parent.clone()),
+                ..SstIteratorOptions::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let internal = match &iter.delegate {
+            SstIteratorDelegate::Direct(inner) => inner,
+            SstIteratorDelegate::Filter(filtered) => &filtered.inner,
+        };
+        let originals: Vec<_> = internal
+            .fetch_tasks
+            .iter()
+            .filter_map(|fetch| match fetch {
+                FetchTask::InFlight(task) => Some(task.abort_handle()),
+                _ => None,
+            })
+            .collect();
+        let started =
+            tokio::time::timeout(std::time::Duration::from_secs(2), cache.wait_started()).await;
+        if started.is_err() {
+            cache.release();
+            settle_scan_fixture_tasks(&originals).await;
+        }
+        assert!(started.is_ok(), "actual second prefetch did not start");
+        assert!(
+            !originals.is_empty(),
+            "fixture has no retained original prefetch identity"
+        );
+        (iter, cache, parent, originals)
+    }
+
+    async fn settle_scan_fixture_tasks(originals: &[tokio::task::AbortHandle]) {
+        let complete = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while originals.iter().any(|task| !task.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if complete.is_err() {
+            for task in originals {
+                task.abort();
+            }
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while originals.iter().any(|task| !task.is_finished()) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+        }
+        assert!(
+            complete.is_ok(),
+            "original fixture prefetch did not settle after release"
+        );
+    }
+
+    // Existing API: the original held fetch must join before Seek replaces its
+    // window. The new target stays inside the SST and uses a different block.
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_seek_joins_original_prefetch_before_replacement() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (mut iter, cache, parent, originals) = held_scan_prefetch().await;
+        let mut seek = Box::pin(iter.seek(b"k025"));
+        let first_poll = futures::poll!(seek.as_mut());
+        let early = match first_poll {
+            std::task::Poll::Ready(result) => Some(result),
+            std::task::Poll::Pending => {
+                tokio::time::timeout(std::time::Duration::from_millis(100), seek.as_mut())
+                    .await
+                    .ok()
+            }
+        };
+        let held_on_return = cache.dropped.load(SeqCst) == 0;
+        let returned_early = early.is_some();
+        cache.release();
+        let result = match early {
+            Some(result) => result,
+            None => tokio::time::timeout(std::time::Duration::from_secs(2), seek.as_mut())
+                .await
+                .unwrap(),
+        };
+        drop(seek);
+        settle_scan_fixture_tasks(&originals).await;
+        // Every assertion follows release and completion of the original call.
+        result.unwrap();
+        let row = iter.next().await.unwrap().unwrap();
+        assert_eq!(row.key.as_ref(), b"k025");
+        while iter.next().await.unwrap().is_some() {}
+        assert_eq!(cache.started.load(SeqCst), 1);
+        assert_eq!(cache.dropped.load(SeqCst), 1);
+        assert!(!parent.is_cancelled(), "Seek canceled the caller token");
+        assert!(
+            !returned_early,
+            "Seek returned while original held prefetch was live"
+        );
+        assert!(
+            held_on_return,
+            "fixture released the original lookup too early"
+        );
+    }
 }
