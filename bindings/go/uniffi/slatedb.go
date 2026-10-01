@@ -1680,6 +1680,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_dbiterator_close()
+		})
+		if checksum != 19979 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbiterator_close: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbiterator_next()
 		})
 		if checksum != 1225 {
@@ -3823,7 +3832,7 @@ func (c FfiConverterBlockTransformer) register() {
 	C.uniffi_slatedb_uniffi_fn_init_callback_vtable_blocktransformer(&UniffiVTableCallbackInterfaceBlockTransformerINSTANCE)
 }
 
-// A handle that cancels a point read or a foreground `Admin` loop.
+// A handle that cancels an original read/Scan or a foreground `Admin` loop.
 // Repeated cancellation is safe. It can occur before or during the call.
 type CancellationTokenInterface interface {
 	// Requests cancellation of each read or loop that holds this token.
@@ -3831,7 +3840,7 @@ type CancellationTokenInterface interface {
 	IsCancelled() bool
 }
 
-// A handle that cancels a point read or a foreground `Admin` loop.
+// A handle that cancels an original read/Scan or a foreground `Admin` loop.
 // Repeated cancellation is safe. It can occur before or during the call.
 type CancellationToken struct {
 	ffiObject FfiObject
@@ -5721,6 +5730,10 @@ func (_ FfiDestroyerDbCache) Destroy(value *DbCache) {
 
 // Async iterator returned by scan APIs.
 type DbIteratorInterface interface {
+	// Cancel original work before waiting for an active call's mutex, then
+	// join that call and every retained iterator child. Destroy alone is not
+	// this asynchronous close. Repeated calls retain the original error.
+	Close() error
 	// Returns the next key/value pair from the iterator.
 	Next() (*KeyValue, error)
 	// Returns up to `max` key/value pairs from the iterator in one call.
@@ -5740,6 +5753,40 @@ type DbIteratorInterface interface {
 // Async iterator returned by scan APIs.
 type DbIterator struct {
 	ffiObject FfiObject
+}
+
+// Cancel original work before waiting for an active call's mutex, then
+// join that call and every retained iterator child. Destroy alone is not
+// this asynchronous close. Repeated calls retain the original error.
+func (_self *DbIterator) Close() error {
+	_pointer := _self.ffiObject.incrementPointer("*DbIterator")
+	defer _self.ffiObject.decrementPointer()
+	_, err := uniffiRustCallAsync[*Error](
+		FfiConverterErrorINSTANCE,
+		// completeFn
+		func(handle C.uint64_t, status *C.RustCallStatus) struct{} {
+			C.ffi_slatedb_uniffi_rust_future_complete_void(handle, status)
+			return struct{}{}
+		},
+		// liftFn
+		func(_ struct{}) struct{} { return struct{}{} },
+		C.uniffi_slatedb_uniffi_fn_method_dbiterator_close(
+			_pointer),
+		// pollFn
+		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_poll_void(handle, continuation, data)
+		},
+		// freeFn
+		func(handle C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_free_void(handle)
+		},
+	)
+
+	if err == nil {
+		return nil
+	}
+
+	return err
 }
 
 // Returns the next key/value pair from the iterator.
@@ -12511,6 +12558,8 @@ type ScanOptions struct {
 	FilterContext *FilterContext
 	// Optional caller-supplied tracing settings.
 	TracingOptions *TracingOptions
+	// Retained for the whole iterator lifetime. Close cancels only its child.
+	CancellationToken **CancellationToken
 }
 
 func (r *ScanOptions) Destroy() {
@@ -12522,6 +12571,7 @@ func (r *ScanOptions) Destroy() {
 	FfiDestroyerOptionalIterationOrder{}.Destroy(r.Order)
 	FfiDestroyerOptionalFilterContext{}.Destroy(r.FilterContext)
 	FfiDestroyerOptionalTracingOptions{}.Destroy(r.TracingOptions)
+	FfiDestroyerOptionalCancellationToken{}.Destroy(r.CancellationToken)
 }
 
 type FfiConverterScanOptions struct{}
@@ -12542,6 +12592,7 @@ func (c FfiConverterScanOptions) Read(reader io.Reader) ScanOptions {
 		FfiConverterOptionalIterationOrderINSTANCE.Read(reader),
 		FfiConverterOptionalFilterContextINSTANCE.Read(reader),
 		FfiConverterOptionalTracingOptionsINSTANCE.Read(reader),
+		FfiConverterOptionalCancellationTokenINSTANCE.Read(reader),
 	}
 }
 
@@ -12562,6 +12613,7 @@ func (c FfiConverterScanOptions) Write(writer io.Writer, value ScanOptions) {
 	FfiConverterOptionalIterationOrderINSTANCE.Write(writer, value.Order)
 	FfiConverterOptionalFilterContextINSTANCE.Write(writer, value.FilterContext)
 	FfiConverterOptionalTracingOptionsINSTANCE.Write(writer, value.TracingOptions)
+	FfiConverterOptionalCancellationTokenINSTANCE.Write(writer, value.CancellationToken)
 }
 
 type FfiDestroyerScanOptions struct{}

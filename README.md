@@ -24,15 +24,25 @@ Checkout [slatedb.io](https://slatedb.io) to learn more.
 
 ## Othermemory point-read candidate
 
-Branch `codex/fh-point-read-window` adds cooperative cancellation to point reads while retaining the original call and its started work. This is a source candidate; it is not the installed shared binding or a complete native release.
+The published point baseline `ff1e3b67` adds cooperative cancellation to point reads. It retains the original call and its started work. Its shared Darwin debug roll completed on 2026-09-30 with library SHA256 `32d5feef367d3982986a7a23c0d727dc2ac316d3e198391920d462ac43750153`. That narrow result does not complete native acceptance.
 
 | Component | Reproducible source / evidence | Limit |
 | --- | --- | --- |
 | Point core and original multi-source joins | `17e7451c5c57abd3a23545be1894685ea78c0fc4`: 58 selected native controls pass; four window omissions fail at their named assertions | Complete native suites remain separate |
-| Existing UniFFI token and point adapters | `5b4966722f99709d1be85e13d990d8945281150e`: private Linux debug library SHA256 `5c23cdf5c08199a1d03682401b3e2df7b061c82fdfddcabc2c59be9aaa0fe6d1` | No Scan cancellation or shared installation |
+| Existing UniFFI token and point adapters | `5b4966722f99709d1be85e13d990d8945281150e`: private Linux debug library SHA256 `5c23cdf5c08199a1d03682401b3e2df7b061c82fdfddcabc2c59be9aaa0fe6d1` | Selected point scope only |
 | Generated Go and callback/reader contract | `02ff5c6c41788fa2935f70b9570581d246a01e7d`: 28 named nodes pass ordinary and race; both selected-package vets pass | Complete Go modules and explicit binding omissions remain separate |
 
 Cancellable concurrent reads made four modeled GETs versus one on the legacy deduplicated path. Cache hits retain the original lookup; a local cache stall can still delay cancellation. No regional performance neutrality or fixed wall-clock interruption is claimed. The [dated run report](docs/runs/RUN_2026-09-30_native-point-cancellation.md) preserves original failures, exact commands, tool/library hashes, generated-byte provenance and process closure. Fork publication does not authorize a dependent merge; the shared binding roll is a separate, locked operation.
+
+## Othermemory Scan successor
+
+This prepared successor adds owned Scan cancellation and async iterator cleanup. It keeps the existing owners and joins their started work. It does not add a registry. Seek retires its original prefetch before replacement. Constructor errors join all started children. Selected storage errors keep their precedence.
+
+The [dated Scan report](docs/runs/RUN_2026-10-01_native-scan-ownership.md) records the tested source, actual generated files and retained failures. The candidate library reported 2,193 passes and one declared ignore. Four ownership omissions failed at their intended assertions. A separate application run completed 286 passing nodes and 11 classified skips in each ordinary and race mode. Both scoped vets passed.
+
+Four concurrent cold hybrid scans made 64 GETs without tokens and 256 with tokens. Memory-cache scans made 64 and 67. Warm scans made no GETs. These are cache mechanics, not real-store latency. A held Foyer lookup can exceed a request budget before it joins.
+
+This source is prepared for review. Publication, complete native workspace/DST acceptance and the shared Darwin Scan roll remain separate. The existing point15 roll is the rollback baseline. A dependent application merge remains blocked until its required gates pass.
 
 ## Get Started
 
