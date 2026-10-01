@@ -42,7 +42,9 @@ The [dated Scan report](docs/runs/RUN_2026-10-01_native-scan-ownership.md) recor
 
 Four concurrent cold hybrid scans made 64 GETs without tokens and 256 with tokens. Memory-cache scans made 64 and 67. Warm scans made no GETs. These are cache mechanics, not real-store latency. A held Foyer lookup can exceed a request budget before it joins.
 
-This source is prepared for review. Publication, complete native workspace/DST acceptance and the shared Darwin Scan roll remain separate. The existing point15 roll is the rollback baseline. A dependent application merge remains blocked until its required gates pass.
+Scan source `9f2fbca8` is published on the fork. Complete native workspace/DST acceptance and the shared Darwin Scan roll remain open. The existing point15 roll is the rollback baseline. A dependent application merge remains blocked until its required gates pass.
+
+The [Nextest group record](docs/runs/RUN_2026-10-01_nextest-original-group.md) adds four unrun Linux controls before a wrapper repair. The wrapper now uses `exec` so Nextest owns the original test process. The `ci` and `dst` profiles remain unchanged. Timeout backtraces are no longer available. Full acceptance still requires actual proof that every original child is gone.
 
 ## Get Started
 
