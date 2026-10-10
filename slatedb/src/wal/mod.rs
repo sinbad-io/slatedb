@@ -172,6 +172,9 @@ pub struct WalStatus {
     pub closed_reason: Option<WalError>,
     /// The estimated in-memory bytes used by the WAL to buffer unflushed writes.
     pub estimated_bytes: usize,
+    /// The part of `estimated_bytes` not yet frozen into a WAL file, which the
+    /// next flush freezes.
+    pub current_estimated_bytes: usize,
     /// The id of the last WAL file that was durably flushed
     pub last_flushed_wal_id: u64,
     /// The last sequence number that was durably flushed

@@ -61,11 +61,11 @@ pub(crate) enum BatchWriterMessage {
 
 pub(crate) struct BatchWriterFlush {
     /// If true, then also freeze the current active memtable.
-    freeze_memtable: bool,
+    pub(crate) freeze_memtable: bool,
     /// Sends a message when the writer has processed the flush message. On successful receipt
     /// of a message, the caller should wait on the received Receiver to get the result of the
     /// wal flush.
-    done: oneshot::Sender<Result<FlushResultFuture, SlateDBError>>,
+    pub(crate) done: oneshot::Sender<Result<FlushResultFuture, SlateDBError>>,
 }
 
 pub(crate) struct WriteBatchRequest {

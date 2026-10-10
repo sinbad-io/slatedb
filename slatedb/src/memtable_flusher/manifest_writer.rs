@@ -467,6 +467,9 @@ impl ManifestWriterHandler {
         for uploaded in &staged_batch {
             uploaded.imm_memtable.notify_uploaded(Ok(()));
         }
+        if self.db.unflushed.is_some() {
+            let _ = self.db.publish_unflushed();
+        }
         self.db
             .db_stats
             .immutable_memtable_flushes
@@ -1164,6 +1167,7 @@ mod tests {
                 None,
                 Arc::new(status_manager),
                 segment_extractor,
+                None,
             )
             .await
             .unwrap(),

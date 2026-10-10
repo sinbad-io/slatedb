@@ -157,6 +157,7 @@ use crate::merge_operator::MergeOperatorType;
 use crate::paths::PathResolver;
 use crate::retrying_object_store::RetryingObjectStore;
 use crate::tablestore::{TableStore, TableStoreKind};
+use crate::unflushed_budget::UnflushedBudget;
 use crate::utils::ObjectStoreType;
 use crate::utils::SafeSender;
 use crate::utils::WatchableOnceCell;
@@ -198,6 +199,7 @@ pub struct DbBuilder<P: Into<Path>> {
     metrics_recorder: Arc<dyn MetricsRecorder>,
     segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
     wal_writer_init: Option<Box<dyn wal::WriterInit>>,
+    unflushed_budget: Option<Arc<UnflushedBudget>>,
 }
 
 impl<P: Into<Path>> DbBuilder<P> {
@@ -229,6 +231,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
             segment_extractor: None,
             wal_writer_init: None,
+            unflushed_budget: None,
         }
     }
 
@@ -303,6 +306,16 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// Disables the sst block/metadata cache
     pub fn with_db_cache_disabled(mut self) -> Self {
         self.db_cache = None;
+        self
+    }
+
+    /// Counts this database's unflushed bytes against `budget`, shared with
+    /// every other database built with it. A write that finds the budget's sum
+    /// at or above its capacity waits, as one past `max_unflushed_bytes` does,
+    /// and the member with the most bytes a flush can freeze is asked to flush.
+    /// The budget must be at least `max_unflushed_bytes`.
+    pub fn with_unflushed_budget(mut self, budget: Arc<UnflushedBudget>) -> Self {
+        self.unflushed_budget = Some(budget);
         self
     }
 
@@ -461,6 +474,16 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// Builds and opens the database.
     pub async fn build(self) -> Result<Db, crate::Error> {
         self.settings.validate()?;
+        if let Some(budget) = &self.unflushed_budget {
+            if budget.capacity() < self.settings.max_unflushed_bytes {
+                return Err(SlateDBError::InvalidConfiguration(format!(
+                    "the unflushed budget ({}) must be at least max_unflushed_bytes ({})",
+                    budget.capacity(),
+                    self.settings.max_unflushed_bytes,
+                ))
+                .into());
+            }
+        }
 
         let path = self.path.into();
         // TODO: proper URI generation, for now it works just as a flag
@@ -706,6 +729,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                 self.merge_operator.clone(),
                 status_manager,
                 self.segment_extractor.clone(),
+                self.unflushed_budget.clone(),
             )
             .await?,
         );
@@ -870,6 +894,9 @@ impl<P: Into<Path>> DbBuilder<P> {
 
         // Replay WAL
         inner.replay_wal(replay_iterator).await?;
+        if let Some(member) = &inner.unflushed {
+            member.accept_flushes(inner.write_notifier.clone());
+        }
 
         // Preload cache if enabled
         if let Some(cached_obj_store) = cached_object_store {
