@@ -505,6 +505,7 @@ impl EncodedSsTable {
             + self.footer.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn put_remaining<T: BufMut>(&self, buf: &mut T) {
         for chunk in self.unconsumed_blocks.iter() {
             buf.put_slice(chunk.encoded_bytes.as_ref())
@@ -512,11 +513,22 @@ impl EncodedSsTable {
         buf.put_slice(self.footer.as_ref());
     }
 
+    #[cfg(test)]
     pub(crate) fn remaining_as_bytes(&self) -> Bytes {
         let total_size = self.remaining_len();
         let mut data = Vec::<u8>::with_capacity(total_size);
         self.put_remaining(&mut data);
         Bytes::from(data)
+    }
+
+    /// The remaining encoded blocks and the footer as one payload that shares
+    /// their buffers, so nothing is copied.
+    pub(crate) fn remaining_as_payload(&self) -> object_store::PutPayload {
+        self.unconsumed_blocks
+            .iter()
+            .map(|chunk| chunk.encoded_bytes.clone())
+            .chain(std::iter::once(self.footer.clone()))
+            .collect()
     }
 }
 
