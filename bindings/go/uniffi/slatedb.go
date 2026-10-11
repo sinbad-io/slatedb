@@ -807,6 +807,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_dbbuilder_with_unflushed_budget()
+		})
+		if checksum != 42492 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbbuilder_with_unflushed_budget: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbbuilder_with_wal_object_store()
 		})
 		if checksum != 4790 {
@@ -1887,6 +1896,24 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_unflushedbudget_capacity()
+		})
+		if checksum != 5742 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_unflushedbudget_capacity: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_unflushedbudget_used()
+		})
+		if checksum != 45355 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_unflushedbudget_used: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_slatedbwaliterator_next()
 		})
 		if checksum != 46461 {
@@ -2198,6 +2225,15 @@ func uniffiCheckChecksums() {
 		if checksum != 7949 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_constructor_settings_load: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_constructor_unflushedbudget_new()
+		})
+		if checksum != 62541 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_constructor_unflushedbudget_new: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -5240,6 +5276,10 @@ type DbBuilderInterface interface {
 	// Reads wall time from `clock` instead of the process clock: TTL expiry,
 	// flush and poll ticks. A mock clock makes the database's timers a test's to drive.
 	WithSystemClock(clock *SystemClock) error
+	// Counts this database's unflushed bytes against `budget`, shared with
+	// every database built with it; the budget must be at least the
+	// database's `max_unflushed_bytes`.
+	WithUnflushedBudget(budget *UnflushedBudget) error
 	// Uses a separate object store for WAL files.
 	WithWalObjectStore(walObjectStore *ObjectStore) error
 }
@@ -5446,6 +5486,20 @@ func (_self *DbBuilder) WithSystemClock(clock *SystemClock) error {
 	_, _uniffiErr := rustCallWithError[*Error](FfiConverterError{}, func(_uniffiStatus *C.RustCallStatus) bool {
 		C.uniffi_slatedb_uniffi_fn_method_dbbuilder_with_system_clock(
 			_pointer, FfiConverterSystemClockINSTANCE.Lower(clock), _uniffiStatus)
+		return false
+	})
+	return _uniffiErr.AsError()
+}
+
+// Counts this database's unflushed bytes against `budget`, shared with
+// every database built with it; the budget must be at least the
+// database's `max_unflushed_bytes`.
+func (_self *DbBuilder) WithUnflushedBudget(budget *UnflushedBudget) error {
+	_pointer := _self.ffiObject.incrementPointer("*DbBuilder")
+	defer _self.ffiObject.decrementPointer()
+	_, _uniffiErr := rustCallWithError[*Error](FfiConverterError{}, func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_slatedb_uniffi_fn_method_dbbuilder_with_unflushed_budget(
+			_pointer, FfiConverterUnflushedBudgetINSTANCE.Lower(budget), _uniffiStatus)
 		return false
 	})
 	return _uniffiErr.AsError()
@@ -10253,6 +10307,113 @@ func LowerToExternalSystemClock(value *SystemClock) uint64 {
 type FfiDestroyerSystemClock struct{}
 
 func (_ FfiDestroyerSystemClock) Destroy(value *SystemClock) {
+	value.Destroy()
+}
+
+// One bound on the bytes every database built with it holds unflushed, by
+// the engine's estimate. A write that finds the sum at or above the capacity
+// waits, and the database with the most bytes a flush can freeze is asked to
+// flush.
+type UnflushedBudgetInterface interface {
+	// The bytes the sharing databases may hold unflushed.
+	Capacity() uint64
+	// The bytes the sharing databases last published as unflushed.
+	Used() uint64
+}
+
+// One bound on the bytes every database built with it holds unflushed, by
+// the engine's estimate. A write that finds the sum at or above the capacity
+// waits, and the database with the most bytes a flush can freeze is asked to
+// flush.
+type UnflushedBudget struct {
+	ffiObject FfiObject
+}
+
+// A budget of `capacity` bytes.
+func NewUnflushedBudget(capacity uint64) (*UnflushedBudget, error) {
+	_uniffiRV, _uniffiErr := rustCallWithError[*Error](FfiConverterError{}, func(_uniffiStatus *C.RustCallStatus) C.uint64_t {
+		return C.uniffi_slatedb_uniffi_fn_constructor_unflushedbudget_new(FfiConverterUint64INSTANCE.Lower(capacity), _uniffiStatus)
+	})
+	if _uniffiErr != nil {
+		var _uniffiDefaultValue *UnflushedBudget
+		return _uniffiDefaultValue, _uniffiErr
+	} else {
+		return FfiConverterUnflushedBudgetINSTANCE.Lift(_uniffiRV), nil
+	}
+}
+
+// The bytes the sharing databases may hold unflushed.
+func (_self *UnflushedBudget) Capacity() uint64 {
+	_pointer := _self.ffiObject.incrementPointer("*UnflushedBudget")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterUint64INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint64_t {
+		return C.uniffi_slatedb_uniffi_fn_method_unflushedbudget_capacity(
+			_pointer, _uniffiStatus)
+	}))
+}
+
+// The bytes the sharing databases last published as unflushed.
+func (_self *UnflushedBudget) Used() uint64 {
+	_pointer := _self.ffiObject.incrementPointer("*UnflushedBudget")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterUint64INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint64_t {
+		return C.uniffi_slatedb_uniffi_fn_method_unflushedbudget_used(
+			_pointer, _uniffiStatus)
+	}))
+}
+func (object *UnflushedBudget) Destroy() {
+	runtime.SetFinalizer(object, nil)
+	object.ffiObject.destroy()
+}
+
+type FfiConverterUnflushedBudget struct{}
+
+var FfiConverterUnflushedBudgetINSTANCE = FfiConverterUnflushedBudget{}
+
+func (c FfiConverterUnflushedBudget) Lift(handle C.uint64_t) *UnflushedBudget {
+	result := &UnflushedBudget{
+		newFfiObject(
+			handle,
+			func(handle C.uint64_t, status *C.RustCallStatus) C.uint64_t {
+				return C.uniffi_slatedb_uniffi_fn_clone_unflushedbudget(handle, status)
+			},
+			func(handle C.uint64_t, status *C.RustCallStatus) {
+				C.uniffi_slatedb_uniffi_fn_free_unflushedbudget(handle, status)
+			},
+		),
+	}
+	runtime.SetFinalizer(result, (*UnflushedBudget).Destroy)
+	return result
+}
+
+func (c FfiConverterUnflushedBudget) Read(reader io.Reader) *UnflushedBudget {
+	return c.Lift(C.uint64_t(readUint64(reader)))
+}
+
+func (c FfiConverterUnflushedBudget) Lower(value *UnflushedBudget) C.uint64_t {
+	// TODO: this is bad - all synchronization from ObjectRuntime.go is discarded here,
+	// because the handle will be decremented immediately after this function returns,
+	// and someone will be left holding onto a non-locked handle.
+	handle := value.ffiObject.incrementPointer("*UnflushedBudget")
+	defer value.ffiObject.decrementPointer()
+	return handle
+}
+
+func (c FfiConverterUnflushedBudget) Write(writer io.Writer, value *UnflushedBudget) {
+	writeUint64(writer, uint64(c.Lower(value)))
+}
+
+func LiftFromExternalUnflushedBudget(handle uint64) *UnflushedBudget {
+	return FfiConverterUnflushedBudgetINSTANCE.Lift(C.uint64_t(handle))
+}
+
+func LowerToExternalUnflushedBudget(value *UnflushedBudget) uint64 {
+	return uint64(FfiConverterUnflushedBudgetINSTANCE.Lower(value))
+}
+
+type FfiDestroyerUnflushedBudget struct{}
+
+func (_ FfiDestroyerUnflushedBudget) Destroy(value *UnflushedBudget) {
 	value.Destroy()
 }
 

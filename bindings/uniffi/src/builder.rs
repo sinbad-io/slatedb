@@ -17,6 +17,7 @@ use crate::object_store::ObjectStore;
 use crate::runtime;
 use crate::settings::Settings;
 use crate::types::{BlockCachePolicy, CloneSourceSpec, KeyRange};
+use crate::unflushed_budget::UnflushedBudget;
 use crate::MetricsRecorder;
 use parking_lot::Mutex;
 
@@ -79,6 +80,14 @@ impl DbBuilder {
     /// uniqueness and stability across reopens.
     pub fn with_db_cache(&self, db_cache: Arc<DbCache>, db_cache_id: u64) -> Result<(), Error> {
         self.update_builder(|builder| builder.with_db_cache(db_cache.inner.clone(), db_cache_id))
+            .map_err(Into::into)
+    }
+
+    /// Counts this database's unflushed bytes against `budget`, shared with
+    /// every database built with it; the budget must be at least the
+    /// database's `max_unflushed_bytes`.
+    pub fn with_unflushed_budget(&self, budget: Arc<UnflushedBudget>) -> Result<(), Error> {
+        self.update_builder(|builder| builder.with_unflushed_budget(budget.inner.clone()))
             .map_err(Into::into)
     }
 
