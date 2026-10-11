@@ -19,6 +19,7 @@ impl FakeWalWriter {
     ) -> Self {
         let status = WalStatus {
             estimated_bytes: 0,
+            current_estimated_bytes: 0,
             last_flushed_wal_id,
             last_flushed_seq: None,
             buffered_wal_entries_count: 0,

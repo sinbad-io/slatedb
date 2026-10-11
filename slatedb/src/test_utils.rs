@@ -1753,6 +1753,108 @@ pub(crate) enum RecordedCall {
 
 /// Wraps an object store and records the tags carried by each
 /// get/put/multipart-init call, delegating all I/O to the inner store.
+/// Answers `NotFound` to every read, other than a head, of the paths it hides,
+/// as if each had been deleted after its writer listed it; everything else
+/// passes through.
+#[derive(Debug)]
+pub(crate) struct HidingObjectStore {
+    inner: Arc<dyn ObjectStore>,
+    hidden: parking_lot::Mutex<Vec<Path>>,
+    hidden_reads: AtomicUsize,
+}
+
+impl HidingObjectStore {
+    pub(crate) fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            hidden: parking_lot::Mutex::new(Vec::new()),
+            hidden_reads: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn hide(&self, path: Path) {
+        self.hidden.lock().push(path);
+    }
+
+    /// How many reads were answered `NotFound`.
+    pub(crate) fn hidden_reads(&self) -> usize {
+        self.hidden_reads.load(Ordering::Acquire)
+    }
+}
+
+impl fmt::Display for HidingObjectStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HidingObjectStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for HidingObjectStore {
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        if !options.head && self.hidden.lock().contains(location) {
+            self.hidden_reads.fetch_add(1, Ordering::AcqRel);
+            return Err(object_store::Error::NotFound {
+                path: location.to_string(),
+                source: "hidden by the test".into(),
+            });
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: OS_PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct RecordingObjectStore {
     inner: Arc<dyn ObjectStore>,
