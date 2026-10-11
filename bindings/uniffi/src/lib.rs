@@ -21,6 +21,7 @@ mod object_store_builder;
 mod runtime;
 mod settings;
 mod types;
+mod unflushed_budget;
 mod validation;
 mod wal_reader;
 mod write_batch;
@@ -63,6 +64,7 @@ pub use types::{
     SegmentPrefix, SortedRun, SourceId, SsTableHandle, SsTableId, SsTableInfo, SsTableView,
     SstType, VersionedCompactions, VersionedManifest,
 };
+pub use unflushed_budget::UnflushedBudget;
 pub use wal_reader::{SlateDbWalIterator, SlateDbWalReader, SlateDbWalReaderOptions, WalRows};
 pub use write_batch::WriteBatch;
 pub use write_handle::WriteHandle;

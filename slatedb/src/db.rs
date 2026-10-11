@@ -69,6 +69,7 @@ use crate::snapshot_manager::SnapshotManager;
 use crate::tablestore::TableStore;
 use crate::transaction_manager::TransactionManager;
 use crate::types::KeyValue;
+use crate::unflushed_budget::{BudgetMember, UnflushedBudget, UnflushedBytes};
 use crate::utils::{format_bytes_si, SafeSender, WatchableOnceCellReader};
 use crate::wal_replay::{WalReplayIterator, WalReplayOptions};
 use crate::{DbCacheManagerOps, DbMetadataOps, DbReadOps, DbWriteOps};
@@ -119,6 +120,7 @@ pub(crate) struct DbInner {
     /// L0 SSTs. When `None`, the database is the singleton `prefix=""`
     /// segment encoded in the manifest's top-level tree.
     pub(crate) segment_extractor: Option<Arc<dyn PrefixExtractor>>,
+    pub(crate) unflushed: Option<Arc<BudgetMember>>,
 }
 
 impl DbInner {
@@ -136,6 +138,7 @@ impl DbInner {
         merge_operator: Option<MergeOperatorType>,
         status_manager: Arc<DbStatusManager>,
         segment_extractor: Option<Arc<dyn PrefixExtractor>>,
+        unflushed_budget: Option<Arc<UnflushedBudget>>,
     ) -> Result<Self, SlateDBError> {
         // both last_seq and last_committed_seq will be updated after WAL replay.
         let last_l0_seq = manifest.value.core.last_l0_seq;
@@ -174,11 +177,14 @@ impl DbInner {
 
         let txn_manager = Arc::new(TransactionManager::new(oracle.clone(), rand.clone()));
         let snapshot_manager = Arc::new(SnapshotManager::new(oracle.clone(), rand.clone()));
+        let unflushed = unflushed_budget.map(|budget| Arc::new(budget.join()));
         let wal_observer = DbWalObserver::new(
             wal_observer,
             oracle.clone(),
             state.clone(),
             status_manager.clone(),
+            unflushed.clone(),
+            table_store.clone(),
         );
 
         let db_inner = Self {
@@ -202,6 +208,7 @@ impl DbInner {
             snapshot_manager,
             status_manager,
             segment_extractor,
+            unflushed,
         };
         Ok(db_inner)
     }
@@ -302,31 +309,25 @@ impl DbInner {
         rx.await?
     }
 
+    /// Reads this database's unflushed bytes and publishes them to its budget.
+    pub(crate) fn publish_unflushed(&self) -> Result<(UnflushedBytes, WalStatus), SlateDBError> {
+        Ok(publish_unflushed(
+            self.unflushed.as_deref(),
+            self.wal_observer.wrapped.as_ref(),
+            &self.state,
+            &self.table_store,
+        )?)
+    }
+
     #[inline]
     pub(crate) async fn maybe_apply_backpressure(&self) -> Result<(), SlateDBError> {
+        let budget = self.unflushed.as_deref().map(BudgetMember::budget);
         loop {
             self.check_closed()?;
-            let wal_status = self.wal_observer.status()?;
-            let (active_memtable_size_bytes, imm_memtable_size_bytes) = {
-                let guard = self.state.read();
-                let estimate = |metadata: KVTableMetadata| {
-                    self.table_store.estimate_encoded_size_compacted(
-                        metadata.entry_num,
-                        metadata.entries_size_in_bytes,
-                    )
-                };
-                let active_memtable_size_bytes = estimate(guard.memtable().table().metadata());
-                let imm_memtable_size_bytes = guard
-                    .state()
-                    .imm_memtable
-                    .iter()
-                    .map(|imm| estimate(imm.table().metadata()))
-                    .fold(0usize, |total, size| total.saturating_add(size));
-                (active_memtable_size_bytes, imm_memtable_size_bytes)
-            };
-            let total_mem_size_bytes = active_memtable_size_bytes
-                .saturating_add(imm_memtable_size_bytes)
-                .saturating_add(wal_status.estimated_bytes);
+            let room = budget.map(UnflushedBudget::room);
+            let (bytes, wal_status) = self.publish_unflushed()?;
+            let crossed = budget.is_some_and(UnflushedBudget::crossed);
+            let total_mem_size_bytes = bytes.total();
             self.db_stats
                 .total_mem_size_bytes
                 .set(total_mem_size_bytes as i64);
@@ -334,22 +335,27 @@ impl DbInner {
             trace!(
                 "checking backpressure [total_mem_size_bytes={}, active_memtable_size_bytes={}, imm_memtable_size_bytes={}, wal_size_bytes={}, max_unflushed_bytes={}]",
                 format_bytes_si(total_mem_size_bytes as u64),
-                format_bytes_si(active_memtable_size_bytes as u64),
-                format_bytes_si(imm_memtable_size_bytes as u64),
-                format_bytes_si(wal_status.estimated_bytes as u64),
+                format_bytes_si(bytes.active_memtable as u64),
+                format_bytes_si(bytes.imm_memtables as u64),
+                format_bytes_si(bytes.wal as u64),
                 format_bytes_si(self.settings.max_unflushed_bytes as u64),
             );
 
-            if total_mem_size_bytes >= self.settings.max_unflushed_bytes {
+            if total_mem_size_bytes >= self.settings.max_unflushed_bytes || crossed {
                 self.db_stats.backpressure_count.increment(1);
                 warn!(
-                    "unflushed WAL and memtable size exceeds max_unflushed_bytes. applying backpressure. [total_mem_size_bytes={}, active_memtable_size_bytes={}, imm_memtable_size_bytes={}, wal_size_bytes={}, max_unflushed_bytes={}]",
+                    "unflushed WAL and memtable size exceeds max_unflushed_bytes or the unflushed budget. applying backpressure. [total_mem_size_bytes={}, active_memtable_size_bytes={}, imm_memtable_size_bytes={}, wal_size_bytes={}, max_unflushed_bytes={}, unflushed_budget_used={}, unflushed_budget_capacity={}]",
                     format_bytes_si(total_mem_size_bytes as u64),
-                    format_bytes_si(active_memtable_size_bytes as u64),
-                    format_bytes_si(imm_memtable_size_bytes as u64),
-                    format_bytes_si(wal_status.estimated_bytes as u64),
+                    format_bytes_si(bytes.active_memtable as u64),
+                    format_bytes_si(bytes.imm_memtables as u64),
+                    format_bytes_si(bytes.wal as u64),
                     format_bytes_si(self.settings.max_unflushed_bytes as u64),
+                    format_bytes_si(budget.map_or(0, UnflushedBudget::used) as u64),
+                    format_bytes_si(budget.map_or(0, UnflushedBudget::capacity) as u64),
                 );
+                if let Some(budget) = budget.filter(|_| crossed) {
+                    budget.flush_largest(self.system_clock.now());
+                }
 
                 let maybe_oldest_unflushed_memtable = {
                     let guard = self.state.read();
@@ -360,7 +366,10 @@ impl DbInner {
                 // max_unflushed_bytes but before we get the memtable. During that time, if
                 // the memtable and WAL are fully flushed out, we should short circuit to
                 // avoid blocking indefinitely.
-                if maybe_oldest_unflushed_memtable.is_none() && wal_status.estimated_bytes == 0 {
+                if !crossed
+                    && maybe_oldest_unflushed_memtable.is_none()
+                    && wal_status.estimated_bytes == 0
+                {
                     continue;
                 }
 
@@ -376,6 +385,13 @@ impl DbInner {
                     .wal_observer
                     .wait_until_wal_flushed(wal_status.last_flushed_wal_id);
 
+                let await_room = async {
+                    match room {
+                        Some(room) => room.await,
+                        None => std::future::pending().await,
+                    }
+                };
+
                 let timeout_fut = self.system_clock.sleep(Duration::from_secs(30));
                 let await_closed = async {
                     let mut watcher = self.status_manager.result_reader();
@@ -385,12 +401,21 @@ impl DbInner {
                     }
                 };
 
+                #[cfg(test)]
+                if crossed {
+                    fail_parallel::fail_point_async!(
+                        Arc::clone(&self.fp_registry),
+                        "unflushed-budget-before-wait"
+                    );
+                }
+
                 tokio::select! {
                     biased;
 
                     result = await_closed => result?,
                     result = await_memtable_uploaded => result?,
                     result = await_flush_wal => result?,
+                    _ = await_room => {}
                     _ = timeout_fut => {
                         warn!("backpressure timeout: waited 30s, no memtable/WAL flushed yet");
                     }
@@ -741,6 +766,10 @@ impl Db {
 
         if let Err(e) = self.inner.table_store.close_cache().await {
             warn!("failed to close block cache [error={:?}]", e);
+        }
+
+        if let Some(member) = &self.inner.unflushed {
+            member.leave();
         }
 
         info!("db closed");
@@ -2154,6 +2183,40 @@ impl WriteHandle {
     }
 }
 
+/// Measures a database's unflushed bytes and publishes them to `member`'s
+/// budget under the member's publish order.
+fn publish_unflushed(
+    member: Option<&BudgetMember>,
+    wal: &dyn WalObserver,
+    state: &RwLock<DbState>,
+    table_store: &TableStore,
+) -> Result<(UnflushedBytes, WalStatus), WalStatus> {
+    let publishing = member.map(BudgetMember::publishing);
+    let wal_status = wal.status()?;
+    let bytes = {
+        let guard = state.read();
+        let estimate = |metadata: KVTableMetadata| {
+            table_store
+                .estimate_encoded_size_compacted(metadata.entry_num, metadata.entries_size_in_bytes)
+        };
+        UnflushedBytes {
+            active_memtable: estimate(guard.memtable().table().metadata()),
+            imm_memtables: guard
+                .state()
+                .imm_memtable
+                .iter()
+                .map(|imm| estimate(imm.table().metadata()))
+                .fold(0usize, |total, size| total.saturating_add(size)),
+            wal: wal_status.estimated_bytes,
+            current_wal: wal_status.current_estimated_bytes,
+        }
+    };
+    if let Some(publishing) = &publishing {
+        publishing.publish(bytes);
+    }
+    Ok((bytes, wal_status))
+}
+
 /// Wraps [`WalObserver`] and injects a [`crate::wal::WalStatusListener`]
 /// that updates the oracle and manifest, and drives cross-task notifications about wal events
 /// via a [`tokio::sync::watch`] channel.
@@ -2170,9 +2233,13 @@ impl DbWalObserver {
         oracle: Arc<DbOracle>,
         db_state: Arc<RwLock<DbState>>,
         closed_writer: Arc<dyn ClosedResultWriter>,
+        unflushed: Option<Arc<BudgetMember>>,
+        table_store: Arc<TableStore>,
     ) -> Self {
+        let wrapped: Arc<dyn WalObserver> = wrapped.into();
         let (status_tx, status_rx) = tokio::sync::watch::channel(wrapped.status());
         let closed_reader = closed_writer.result_reader();
+        let observer = Arc::clone(&wrapped);
         wrapped
             .subscribe(Arc::new(move |event| {
                 let status: Result<WalStatus, WalStatus> = match event {
@@ -2183,10 +2250,21 @@ impl DbWalObserver {
                         let mut guard = db_state.write();
                         guard.set_next_wal_id(status.last_flushed_wal_id + 1);
                         drop(guard);
+                        if let Some(member) = unflushed.as_deref() {
+                            let _ = publish_unflushed(
+                                Some(member),
+                                observer.as_ref(),
+                                &db_state,
+                                &table_store,
+                            );
+                        }
                         Ok(status)
                     }
                     WalEvent::WalClosed(status) => {
                         closed_writer.write_result(Err(status.clone().into()));
+                        if let Some(member) = &unflushed {
+                            member.leave();
+                        }
                         Err(status)
                     }
                 };
@@ -2196,7 +2274,7 @@ impl DbWalObserver {
         Self {
             status_rx,
             closed_reader,
-            wrapped: wrapped.into(),
+            wrapped,
         }
     }
 
@@ -2267,6 +2345,7 @@ mod tests {
         OnDemandCompactionSchedulerSupplier, StringConcatMergeOperator,
     };
     use crate::types::RowEntry;
+    use crate::unflushed_budget::UnflushedBudget;
     use crate::wal::slatedb::store::WalTableStore;
     use crate::wal::{SlateDbWalReaderBuilder, WalError, WalReader as _};
     use crate::{proptest_util, test_utils, CloseReason, CompactorBuilder, KeyValue};
@@ -3781,6 +3860,372 @@ mod tests {
             "a WAL SST of three blocks and a footer was put as {wal_puts:?} chunks",
         );
         db.close().await.unwrap();
+    }
+
+    const BUDGET_TEST_CAPACITY: usize = 3 * 64 * 1024;
+
+    fn budget_test_settings(l0_sst_size_bytes: usize) -> Settings {
+        let mut settings = test_db_options(0, l0_sst_size_bytes, None);
+        settings.flush_interval = None;
+        settings.max_unflushed_bytes = BUDGET_TEST_CAPACITY;
+        settings
+    }
+
+    async fn open_on_budget(
+        path: &str,
+        object_store: Arc<dyn ObjectStore>,
+        settings: Settings,
+        budget: &Arc<UnflushedBudget>,
+        fp_registry: Arc<FailPointRegistry>,
+        recorder: Arc<DefaultMetricsRecorder>,
+    ) -> Db {
+        Db::builder(path, object_store)
+            .with_settings(settings)
+            .with_fp_registry(fp_registry)
+            .with_metrics_recorder(recorder)
+            .with_unflushed_budget(budget.clone())
+            .build()
+            .await
+            .unwrap()
+    }
+
+    async fn eventually(what: &str, condition: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what} within 10s"));
+    }
+
+    struct Paused(Arc<FailPointRegistry>, &'static str);
+
+    impl Paused {
+        fn new(fp_registry: &Arc<FailPointRegistry>, name: &'static str) -> Self {
+            fail_parallel::cfg(fp_registry.clone(), name, "pause").unwrap();
+            Self(fp_registry.clone(), name)
+        }
+    }
+
+    impl Drop for Paused {
+        fn drop(&mut self) {
+            let _ = fail_parallel::cfg(self.0.clone(), self.1, "off");
+        }
+    }
+
+    fn backpressured(recorder: &DefaultMetricsRecorder) -> bool {
+        lookup_metric(recorder, crate::db_stats::BACKPRESSURE_COUNT).is_some_and(|v| v > 0)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_unflushed_budget_parks_a_writer_and_flushes_the_largest_cell() {
+        let budget = Arc::new(UnflushedBudget::new(BUDGET_TEST_CAPACITY));
+        let gated = Arc::new(GatedObjectStore::new(Arc::new(InMemory::new())));
+        let recording = Arc::new(test_utils::RecordingObjectStore::new(gated.clone()));
+        let fp_a = Arc::new(FailPointRegistry::new());
+        let a = open_on_budget(
+            "/tmp/test_unflushed_budget_a",
+            recording.clone(),
+            budget_test_settings(128 * 1024),
+            &budget,
+            fp_a.clone(),
+            Arc::new(DefaultMetricsRecorder::new()),
+        )
+        .await;
+        let recorder_b = Arc::new(DefaultMetricsRecorder::new());
+        let b = open_on_budget(
+            "/tmp/test_unflushed_budget_b",
+            Arc::new(InMemory::new()),
+            budget_test_settings(128 * 1024),
+            &budget,
+            Arc::new(FailPointRegistry::new()),
+            recorder_b.clone(),
+        )
+        .await;
+
+        // a holds 64 KiB in its memtable and its WAL, b 72 KiB in its memtable.
+        gated.put_opts_gate.close();
+        let l0_paused = Paused::new(&fp_a, "write-compacted-sst-io-error");
+        recording.clear();
+        a.put(b"a1", vec![1u8; 64 * 1024]).await.unwrap();
+        a.put(b"a2", b"x").await.unwrap();
+        b.put(b"b1", vec![2u8; 72 * 1024]).await.unwrap();
+        b.flush().await.unwrap();
+        assert!(
+            budget.used() >= BUDGET_TEST_CAPACITY,
+            "the two cells hold {} of a {BUDGET_TEST_CAPACITY}-byte budget",
+            budget.used()
+        );
+
+        let parked = tokio::spawn({
+            let b = b.clone();
+            async move { b.put(b"b2", b"y").await }
+        });
+        eventually("b's write waits at the budget", || {
+            backpressured(&recorder_b)
+        })
+        .await;
+        eventually(
+            "a, the larger cell, freezes its memtable and puts its WAL",
+            || {
+                !a.inner.state.read().state().imm_memtable.is_empty()
+                    && !recording.put_chunks(SstType::Wal).is_empty()
+            },
+        )
+        .await;
+        assert!(!parked.is_finished(), "b's write waited for a's flush");
+        assert!(
+            b.inner.state.read().state().imm_memtable.is_empty(),
+            "b, the smaller cell, was not flushed"
+        );
+
+        gated.put_opts_gate.release();
+        tokio::time::timeout(Duration::from_secs(10), parked)
+            .await
+            .expect("b's write lands once a's WAL does")
+            .unwrap()
+            .unwrap();
+
+        drop(l0_paused);
+        a.close().await.unwrap();
+        b.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_unflushed_budget_flushes_the_cell_with_bytes_to_freeze() {
+        let budget = Arc::new(UnflushedBudget::new(BUDGET_TEST_CAPACITY));
+        let open = |name: &'static str, fp: Arc<FailPointRegistry>, recorder| {
+            let budget = budget.clone();
+            async move {
+                open_on_budget(
+                    name,
+                    Arc::new(InMemory::new()),
+                    budget_test_settings(96 * 1024),
+                    &budget,
+                    fp,
+                    recorder,
+                )
+                .await
+            }
+        };
+        let fp_c = Arc::new(FailPointRegistry::new());
+        let recorder_b = Arc::new(DefaultMetricsRecorder::new());
+        let a = open(
+            "/tmp/test_unflushed_budget_freeze_a",
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultMetricsRecorder::new()),
+        )
+        .await;
+        let b = open(
+            "/tmp/test_unflushed_budget_freeze_b",
+            Arc::new(FailPointRegistry::new()),
+            recorder_b.clone(),
+        )
+        .await;
+        let c = open(
+            "/tmp/test_unflushed_budget_freeze_c",
+            fp_c.clone(),
+            Arc::new(DefaultMetricsRecorder::new()),
+        )
+        .await;
+
+        // a holds 44 KiB in its memtable and its WAL; c's 100 KiB froze and
+        // waits on its L0 upload, so c publishes the most and can freeze nothing.
+        let l0_paused = Paused::new(&fp_c, "write-compacted-sst-io-error");
+        a.put(b"a1", vec![1u8; 44 * 1024]).await.unwrap();
+        a.put(b"a2", b"x").await.unwrap();
+        c.put(b"c1", vec![3u8; 100 * 1024]).await.unwrap();
+        c.flush().await.unwrap();
+        assert!(!c.inner.state.read().state().imm_memtable.is_empty());
+        b.put(b"b1", vec![2u8; 20 * 1024]).await.unwrap();
+        b.flush().await.unwrap();
+        assert!(budget.used() >= BUDGET_TEST_CAPACITY);
+
+        tokio::time::timeout(Duration::from_secs(10), b.put(b"b2", b"y"))
+            .await
+            .expect("a's flush makes room for b's write")
+            .unwrap();
+        assert!(backpressured(&recorder_b), "b's write waited at the budget");
+
+        drop(l0_paused);
+        for db in [a, b, c] {
+            db.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_unflushed_budget_releases_a_closed_cells_bytes() {
+        let budget = Arc::new(UnflushedBudget::new(BUDGET_TEST_CAPACITY));
+        let a = open_on_budget(
+            "/tmp/test_unflushed_budget_closed",
+            Arc::new(InMemory::new()),
+            budget_test_settings(128 * 1024),
+            &budget,
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultMetricsRecorder::new()),
+        )
+        .await;
+        a.put(b"a1", vec![1u8; 64 * 1024]).await.unwrap();
+        a.put(b"a2", b"x").await.unwrap();
+        assert!(budget.used() > 0, "a's unflushed bytes count");
+
+        a.close_with_options(CloseOptions { flush_type: None })
+            .await
+            .unwrap();
+        assert_eq!(budget.used(), 0, "a closed cell holds none of the budget");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_unflushed_budget_wakes_a_writer_whose_room_came_before_it_waited() {
+        let budget = Arc::new(UnflushedBudget::new(BUDGET_TEST_CAPACITY));
+        let fp_b = Arc::new(FailPointRegistry::new());
+        let a = open_on_budget(
+            "/tmp/test_unflushed_budget_room_a",
+            Arc::new(InMemory::new()),
+            budget_test_settings(128 * 1024),
+            &budget,
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultMetricsRecorder::new()),
+        )
+        .await;
+        let recorder_b = Arc::new(DefaultMetricsRecorder::new());
+        let b = open_on_budget(
+            "/tmp/test_unflushed_budget_room_b",
+            Arc::new(InMemory::new()),
+            budget_test_settings(128 * 1024),
+            &budget,
+            fp_b.clone(),
+            recorder_b.clone(),
+        )
+        .await;
+        a.put(b"a1", vec![1u8; 64 * 1024]).await.unwrap();
+        a.put(b"a2", b"x").await.unwrap();
+        b.put(b"b1", vec![2u8; 72 * 1024]).await.unwrap();
+        b.flush().await.unwrap();
+        assert!(budget.used() >= BUDGET_TEST_CAPACITY);
+
+        // b stops between reading the budget and waiting on it, while a's
+        // flush lands and a's republish makes room.
+        let before_wait = Paused::new(&fp_b, "unflushed-budget-before-wait");
+        let parked = tokio::spawn({
+            let b = b.clone();
+            async move { b.put(b"b2", b"y").await }
+        });
+        eventually("b's write waits at the budget", || {
+            backpressured(&recorder_b)
+        })
+        .await;
+        eventually("a's WAL and L0 land", || {
+            budget.used() < BUDGET_TEST_CAPACITY / 2
+        })
+        .await;
+        drop(before_wait);
+
+        tokio::time::timeout(Duration::from_secs(5), parked)
+            .await
+            .expect("b's write sees the room a made before it waited")
+            .unwrap()
+            .unwrap();
+        a.close().await.unwrap();
+        b.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_unflushed_budget_under_the_cells_bound_is_refused() {
+        let budget = Arc::new(UnflushedBudget::new(BUDGET_TEST_CAPACITY - 1));
+        let result = Db::builder(
+            "/tmp/test_unflushed_budget_refused",
+            Arc::new(InMemory::new()),
+        )
+        .with_unflushed_budget(budget)
+        .with_settings(budget_test_settings(128 * 1024))
+        .build()
+        .await;
+        let err = result
+            .err()
+            .expect("a budget under max_unflushed_bytes is refused");
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::Invalid),
+            "refused as invalid, got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_unflushed_budget_releases_the_bytes_of_an_open_whose_replay_fails() {
+        let base: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_unflushed_budget_failed_replay";
+        // w0 leaves three 64 KiB WAL files that no L0 holds.
+        let w0 = {
+            let mut settings = test_db_options(0, 1024 * 1024, None);
+            settings.flush_interval = None;
+            settings.max_unflushed_bytes = 2 * 1024 * 1024;
+            Db::builder(path, base.clone())
+                .with_settings(settings)
+                .build()
+                .await
+                .unwrap()
+        };
+        for key in [b"k1", b"k2", b"k3"] {
+            w0.put(key, vec![1u8; 64 * 1024]).await.unwrap();
+            w0.flush().await.unwrap();
+        }
+        let last_wal = w0.inner.wal_observer.status().unwrap().last_flushed_wal_id;
+        w0.close_with_options(CloseOptions { flush_type: None })
+            .await
+            .unwrap();
+
+        // The last of them is gone by the time w1 reads it, after w1 has
+        // replayed and counted the first two.
+        let hiding = Arc::new(test_utils::HidingObjectStore::new(base.clone()));
+        hiding.hide(Path::from(format!(
+            "{}/wal/{:020}.sst",
+            path.trim_start_matches('/'),
+            last_wal
+        )));
+        let budget = Arc::new(UnflushedBudget::new(BUDGET_TEST_CAPACITY));
+        let result = Db::builder(path, hiding.clone())
+            .with_settings(budget_test_settings(32 * 1024))
+            .with_unflushed_budget(budget.clone())
+            .build()
+            .await;
+        assert!(
+            result.is_err(),
+            "w1's replay of a missing WAL file fails its open"
+        );
+        assert!(hiding.hidden_reads() > 0, "w1 read the missing WAL file");
+        assert_eq!(budget.used(), 0, "a failed open holds none of the budget");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_unflushed_budget_releases_a_fenced_cells_bytes() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_unflushed_budget_fenced";
+        let budget = Arc::new(UnflushedBudget::new(BUDGET_TEST_CAPACITY));
+        let a = open_on_budget(
+            path,
+            object_store.clone(),
+            budget_test_settings(128 * 1024),
+            &budget,
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultMetricsRecorder::new()),
+        )
+        .await;
+        a.put(b"a1", vec![1u8; 64 * 1024]).await.unwrap();
+        a.put(b"a2", b"x").await.unwrap();
+        assert!(budget.used() > 0, "a's unflushed bytes count");
+
+        let b = Db::builder(path, object_store.clone())
+            .with_settings(budget_test_settings(128 * 1024))
+            .build()
+            .await
+            .unwrap();
+        assert!(a.flush().await.is_err(), "a, fenced by b, cannot flush");
+        eventually("a's WAL closes and a leaves the budget", || {
+            budget.used() == 0
+        })
+        .await;
+        b.close().await.unwrap();
     }
 
     #[tokio::test]
