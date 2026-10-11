@@ -78,6 +78,7 @@ pub use sst_stats::{BlockStats, SstStats};
 pub use transaction_manager::IsolationLevel;
 pub use types::KeyValue;
 pub use types::{RowEntry, ValueDeletable};
+pub use unflushed_budget::UnflushedBudget;
 pub use wal::slatedb::writer::stats as wal_buffer_stats;
 pub use wal_reader::{WalFile, WalFileIterator, WalReader};
 
@@ -172,6 +173,7 @@ mod tablestore;
 mod test_utils;
 mod transaction_manager;
 mod types;
+mod unflushed_budget;
 mod utils;
 
 mod fence;

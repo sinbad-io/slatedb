@@ -45,6 +45,7 @@ impl BTreeMapWal {
         WalStatus {
             closed_reason: None,
             estimated_bytes: 0,
+            current_estimated_bytes: 0,
             last_flushed_wal_id,
             last_flushed_seq,
             buffered_wal_entries_count: 0,

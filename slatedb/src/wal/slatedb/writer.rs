@@ -305,16 +305,19 @@ impl SlateDbWalWriterInner {
         flushing_wals
     }
 
+    /// Returns the size of the current WAL in bytes.
+    fn current_estimated_bytes(&self, table_store: &WalTableStore) -> usize {
+        table_store.estimate_encoded_size(self.current_wal.len(), self.current_wal.size())
+    }
+
     /// Returns the total size of all unflushed WALs in bytes.
     fn estimated_bytes(&self, table_store: &WalTableStore) -> usize {
-        let current_wal_size =
-            table_store.estimate_encoded_size(self.current_wal.len(), self.current_wal.size());
         let imm_wal_size = self
             .immutable_wals
             .iter()
             .map(|(_, wal)| table_store.estimate_encoded_size(wal.len(), wal.size()))
             .sum::<usize>();
-        current_wal_size + imm_wal_size
+        self.current_estimated_bytes(table_store) + imm_wal_size
     }
 
     fn status(&self, table_store: &WalTableStore) -> Result<WalStatus, WalStatus> {
@@ -336,6 +339,7 @@ impl SlateDbWalWriterInner {
         WalStatus {
             closed_reason: self.flush_task_exited_reason.clone(),
             estimated_bytes: self.estimated_bytes(table_store),
+            current_estimated_bytes: self.current_estimated_bytes(table_store),
             last_flushed_wal_id: self.last_flushed_wal_id,
             last_flushed_seq: self.last_flushed_seq,
             buffered_wal_entries_count,
